@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Turborepo & Build Outputs
+.turbo/
+dist/
+build/
+.next/
+out/
+coverage/
+
+# TypeScript & Caches
+*.tsbuildinfo
+next-env.d.ts
+
+# Environment & Secrets
+.env
+.env*.local
+.env.development
+.env.test
+.env.production
+.env.staging
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Database / Prisma Generated
+prisma/generated/
+generated/
+
+# Python / OCR Output / Temp
+__pycache__/
+*.py[cod]
+*$py.class
+output/
+tmp/
+temp/

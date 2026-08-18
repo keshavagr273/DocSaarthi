@@ -1,0 +1,120 @@
+version: '3.9'
+
+services:
+  # ============================================================
+  # PostgreSQL 16 with pgvector
+  # ============================================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: docsaarthi-postgres
+    environment:
+      POSTGRES_DB: docsaarthi
+      POSTGRES_USER: docsaarthi
+      POSTGRES_PASSWORD: docsaarthi_dev
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U docsaarthi -d docsaarthi']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ============================================================
+  # Redis 7
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: docsaarthi-redis
+    command: redis-server /usr/local/etc/redis/redis.conf
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================
+  # MinIO (S3-compatible object storage)
+  # ============================================================
+  minio:
+    image: minio/minio:latest
+    container_name: docsaarthi-minio
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: docsaarthi_minio
+      MINIO_ROOT_PASSWORD: docsaarthi_minio_secret
+    volumes:
+      - minio_data:/data
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # MinIO bucket initialization (runs once then exits)
+  minio-init:
+    image: minio/mc:latest
+    container_name: docsaarthi-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 docsaarthi_minio docsaarthi_minio_secret;
+      /usr/bin/mc mb --ignore-existing local/docsaarthi;
+      /usr/bin/mc anonymous set none local/docsaarthi;
+      echo 'MinIO bucket initialized.';
+      exit 0;
+      "
+    restart: on-failure
+
+  # ============================================================
+  # PaddleOCR Sidecar (Python FastAPI)
+  # ============================================================
+  paddle-ocr:
+    build:
+      context: ./docker/paddle-ocr
+      dockerfile: Dockerfile
+    container_name: docsaarthi-paddle-ocr
+    ports:
+      - '8081:8081'
+    volumes:
+      - ocr_models:/root/.paddleocr
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8081/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: docsaarthi_postgres_data
+  redis_data:
+    name: docsaarthi_redis_data
+  minio_data:
+    name: docsaarthi_minio_data
+  ocr_models:
+    name: docsaarthi_ocr_models
+
+networks:
+  default:
+    name: docsaarthi_network

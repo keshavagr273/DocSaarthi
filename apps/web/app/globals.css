@@ -1,0 +1,129 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-inter: 'Inter', system-ui, sans-serif;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-surface text-white;
+    background-image:
+      radial-gradient(ellipse at 20% 50%, rgba(91, 110, 245, 0.08) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 20%, rgba(91, 110, 245, 0.05) 0%, transparent 50%);
+    min-height: 100vh;
+  }
+
+  * {
+    @apply border-white/10;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-surface-100;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-white/20 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-white/30;
+  }
+}
+
+@layer components {
+  /* ── Glass card ── */
+  .glass {
+    @apply bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl;
+  }
+
+  .glass-darker {
+    @apply bg-black/30 backdrop-blur-md border border-white/10 rounded-2xl;
+  }
+
+  /* ── Brand button ── */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2
+           px-5 py-2.5 rounded-xl font-semibold text-sm
+           bg-brand-600 hover:bg-brand-500
+           text-white transition-all duration-200
+           hover:shadow-lg hover:shadow-brand-600/30
+           active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed
+           focus:outline-none focus:ring-2 focus:ring-brand-400 focus:ring-offset-2 focus:ring-offset-surface;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2
+           px-5 py-2.5 rounded-xl font-semibold text-sm
+           bg-white/10 hover:bg-white/15
+           text-white/90 border border-white/15
+           transition-all duration-200
+           active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed
+           focus:outline-none focus:ring-2 focus:ring-white/30;
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2
+           px-5 py-2.5 rounded-xl font-semibold text-sm
+           bg-red-600/80 hover:bg-red-500
+           text-white transition-all duration-200
+           active:scale-[0.98] disabled:opacity-50;
+  }
+
+  /* ── Input ── */
+  .input {
+    @apply w-full px-4 py-2.5 rounded-xl
+           bg-white/5 border border-white/15
+           text-white placeholder:text-white/40
+           focus:outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500/50
+           transition-all duration-200 text-sm;
+  }
+
+  .input-error {
+    @apply border-red-500/60 focus:ring-red-500/30 focus:border-red-500/60;
+  }
+
+  /* ── Label ── */
+  .label {
+    @apply block text-sm font-medium text-white/70 mb-1.5;
+  }
+
+  /* ── Error text ── */
+  .error-text {
+    @apply text-red-400 text-xs mt-1.5 flex items-center gap-1;
+  }
+
+  /* ── Badges ── */
+  .badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold;
+  }
+
+  .badge-high { @apply bg-emerald-500/20 text-emerald-300 border border-emerald-500/30; }
+  .badge-medium { @apply bg-amber-500/20 text-amber-300 border border-amber-500/30; }
+  .badge-low { @apply bg-red-500/20 text-red-300 border border-red-500/30; }
+  .badge-queued { @apply bg-blue-500/20 text-blue-300 border border-blue-500/30; }
+  .badge-processing { @apply bg-purple-500/20 text-purple-300 border border-purple-500/30; }
+  .badge-completed { @apply bg-emerald-500/20 text-emerald-300 border border-emerald-500/30; }
+  .badge-failed { @apply bg-red-500/20 text-red-300 border border-red-500/30; }
+  .badge-needs_review { @apply bg-amber-500/20 text-amber-300 border border-amber-500/30; }
+}
+
+@layer utilities {
+  .text-gradient {
+    @apply bg-gradient-to-r from-brand-400 via-purple-400 to-brand-300 bg-clip-text text-transparent;
+  }
+
+  .animate-in {
+    @apply animate-fade-in;
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "baseUrl": "./",
+    "strictPropertyInitialization": false,
+    "paths": {
+      "@docsaarthi/database": ["../../packages/database/src"],
+      "@docsaarthi/shared": ["../../packages/shared/src"]
+    }
+  },
+  "include": ["src/**/*", "../../packages/database/src/**/*", "../../packages/shared/src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+
