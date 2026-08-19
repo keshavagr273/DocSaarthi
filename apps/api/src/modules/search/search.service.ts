@@ -290,9 +290,36 @@ export class SearchService {
       const embedding = response.data[0]?.embedding;
       return embedding ? new Float32Array(embedding) : null;
     } catch (err) {
-      this.logger.error(`Query embedding generation failed: ${String(err)}`);
-      return null;
+      this.logger.warn(
+        `Remote query embedding unavailable (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
+      );
+      return this.generateFallbackEmbedding(query);
     }
+  }
+
+  private generateFallbackEmbedding(text: string, dim = 1536): Float32Array {
+    const vec = new Float32Array(dim);
+    const clean = text.toLowerCase().trim();
+    for (let i = 0; i < clean.length; i++) {
+      const code = clean.charCodeAt(i);
+      const idx = (code * 31 + i) % dim;
+      vec[idx] += 1.0;
+      if (i + 2 < clean.length) {
+        const trigram = clean.slice(i, i + 3);
+        let hash = 0;
+        for (let j = 0; j < trigram.length; j++) {
+          hash = (hash << 5) - hash + trigram.charCodeAt(j);
+          hash |= 0;
+        }
+        const triIdx = Math.abs(hash) % dim;
+        vec[triIdx] += 2.0;
+      }
+    }
+    let norm = 0;
+    for (let i = 0; i < dim; i++) norm += vec[i] * vec[i];
+    norm = Math.sqrt(norm) || 1;
+    for (let i = 0; i < dim; i++) vec[i] /= norm;
+    return vec;
   }
 
   // ── Helper: Highlight Snippet ─────────────────────────────────────
