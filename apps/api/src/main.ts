@@ -76,8 +76,9 @@ async function bootstrap() {
   });
 
   await app.listen(port, '0.0.0.0');
-  logger.log(`DocSaarthi API running on port ${port} (0.0.0.0)`);
-  logger.log(`Swagger UI: http://localhost:${port}/api/docs`);
+  const appUrl = process.env['RENDER_EXTERNAL_URL'] || `http://localhost:${port}`;
+  logger.log(`DocSaarthi API running on port ${port} (0.0.0.0) → ${appUrl}`);
+  logger.log(`Swagger UI: ${appUrl}/api/docs`);
 }
 
 bootstrap().catch((err) => {
