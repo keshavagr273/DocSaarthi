@@ -15,8 +15,8 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
   const config = app.get(ConfigService);
-  const port = config.get<number>('PORT', 3001);
-  const corsOrigin = config.get<string>('CORS_ORIGIN', 'http://localhost:3000');
+  const port = process.env.PORT ? parseInt(process.env.PORT, 10) : config.get<number>('PORT', 3001);
+  const corsOrigin = config.get<string>('CORS_ORIGIN', '*');
 
   // ── Security ────────────────────────────────────────────────
   app.use(
