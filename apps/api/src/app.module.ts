@@ -9,6 +9,7 @@ import { StorageModule } from './modules/storage/storage.module';
 import { QueueModule } from './modules/queue/queue.module';
 import { HealthModule } from './modules/health/health.module';
 import { AuditModule } from './modules/audit/audit.module';
+import { ReviewModule } from './modules/review/review.module';
 import { envSchema } from './config/env.schema';
 
 @Module({
@@ -51,6 +52,7 @@ import { envSchema } from './config/env.schema';
     AuthModule,
     UsersModule,
     DocumentsModule,
+    ReviewModule,
     HealthModule,
   ],
 })

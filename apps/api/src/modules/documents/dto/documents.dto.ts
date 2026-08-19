@@ -7,8 +7,10 @@ import {
   IsOptional,
   MaxLength,
   IsArray,
+  IsEnum,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { DocumentCategory } from '@docsaarthi/database';
 
 const ALLOWED_MIME_TYPES = [
   'application/pdf',
@@ -21,17 +23,17 @@ export class InitiateUploadDto {
   @ApiProperty({ description: 'Original filename with extension' })
   @IsString()
   @MaxLength(255)
-  fileName: string;
+  fileName!: string;
 
   @ApiProperty({ enum: ALLOWED_MIME_TYPES })
   @IsIn(ALLOWED_MIME_TYPES)
-  mimeType: string;
+  mimeType!: string;
 
   @ApiProperty({ description: 'File size in bytes', minimum: 1, maximum: 52428800 })
   @IsNumber()
   @Min(1)
   @Max(52428800)
-  fileSize: number;
+  fileSize!: number;
 
   @ApiPropertyOptional({ description: 'Custom document title (defaults to filename)' })
   @IsOptional()
@@ -49,7 +51,7 @@ export class InitiateUploadDto {
 export class ConfirmUploadDto {
   @ApiProperty({ description: 'Version ID returned from initiate-upload' })
   @IsString()
-  versionId: string;
+  versionId!: string;
 }
 
 export class ListDocumentsDto {
@@ -65,4 +67,47 @@ export class ListDocumentsDto {
 export class UpdateDocumentDto {
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(255) title?: string;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) tags?: string[];
+}
+
+export class OverrideCategoryDto {
+  @ApiProperty({ enum: DocumentCategory, description: 'Corrected document category' })
+  @IsEnum(DocumentCategory)
+  category!: DocumentCategory;
+
+  @ApiPropertyOptional({ description: 'Reason for category override' })
+  @IsOptional()
+  @IsString()
+  reason?: string;
+}
+
+export class CreateVersionDto {
+  @ApiProperty({ description: 'Original filename with extension' })
+  @IsString()
+  @MaxLength(255)
+  fileName!: string;
+
+  @ApiProperty({ enum: ALLOWED_MIME_TYPES })
+  @IsIn(ALLOWED_MIME_TYPES)
+  mimeType!: string;
+
+  @ApiProperty({ description: 'File size in bytes', minimum: 1, maximum: 52428800 })
+  @IsNumber()
+  @Min(1)
+  @Max(52428800)
+  fileSize!: number;
+
+  @ApiPropertyOptional({ description: 'Version change notes' })
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
+export class CompareVersionsDto {
+  @ApiProperty({ description: 'First version ID' })
+  @IsString()
+  v1!: string;
+
+  @ApiProperty({ description: 'Second version ID' })
+  @IsString()
+  v2!: string;
 }

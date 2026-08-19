@@ -5,12 +5,18 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DatabaseService, DocumentStatus, ProcessingStage } from '@docsaarthi/database';
+import { DatabaseService, DocumentStatus, ProcessingStage, DocumentCategory } from '@docsaarthi/database';
 import { StorageService } from '../storage/storage.service';
 import { QueueService } from '../queue/queue.service';
 import { AuditService } from '../audit/audit.service';
 import { generateStorageKey, sanitizeFilename } from '@docsaarthi/shared';
-import { InitiateUploadDto, ListDocumentsDto, UpdateDocumentDto } from './dto/documents.dto';
+import {
+  InitiateUploadDto,
+  ListDocumentsDto,
+  UpdateDocumentDto,
+  OverrideCategoryDto,
+  CreateVersionDto,
+} from './dto/documents.dto';
 
 const ALLOWED_MIME_TYPES = new Set([
   'application/pdf',
@@ -18,6 +24,26 @@ const ALLOWED_MIME_TYPES = new Set([
   'image/jpeg',
   'image/webp',
 ]);
+
+export type FieldDiffStatus = 'UNCHANGED' | 'CHANGED' | 'ADDED' | 'REMOVED';
+
+export interface FieldDiffItem {
+  fieldName: string;
+  status: FieldDiffStatus;
+  v1Value: string | null;
+  v2Value: string | null;
+  v1Confidence: number | null;
+  v2Confidence: number | null;
+}
+
+export interface VersionCompareResult {
+  documentId: string;
+  documentTitle: string;
+  v1: { id: string; versionNumber: number; createdAt: Date };
+  v2: { id: string; versionNumber: number; createdAt: Date };
+  summary: string;
+  fieldDiffs: FieldDiffItem[];
+}
 
 @Injectable()
 export class DocumentsService {
@@ -63,7 +89,7 @@ export class DocumentsService {
           create: {
             versionNumber: 1,
             uploadedByUserId: userId,
-            storageKey: 'PENDING', // Will be set below
+            storageKey: 'PENDING',
           },
         },
       },
@@ -73,7 +99,7 @@ export class DocumentsService {
     const version = document.versions[0]!;
     const storageKey = generateStorageKey(userId, document.id, version.id, dto.fileName);
 
-    // Update version with the real storage key
+    // Update version with real storage key
     await this.db.documentVersion.update({
       where: { id: version.id },
       data: { storageKey },
@@ -118,7 +144,6 @@ export class DocumentsService {
     versionId: string,
     requestId?: string,
   ) {
-    // Verify ownership
     const document = await this.db.document.findFirst({
       where: { id: documentId, userId, isDeleted: false },
       include: {
@@ -135,7 +160,6 @@ export class DocumentsService {
       throw new NotFoundException('Document version not found');
     }
 
-    // Verify file actually exists in MinIO
     const meta = await this.storage.objectExists(version.storageKey);
     if (!meta) {
       throw new BadRequestException(
@@ -143,14 +167,10 @@ export class DocumentsService {
       );
     }
 
-    // ── Server-side MIME type validation (magic bytes) ────────
-    // We download a small chunk to detect file type
     const detectedMime = await this.detectMimeFromStorage(version.storageKey);
     if (detectedMime && detectedMime !== document.mimeType) {
-      // MIME mismatch — delete file and reject
       this.logger.warn(
-        `MIME mismatch for document ${documentId}: ` +
-          `declared=${document.mimeType}, detected=${detectedMime}`,
+        `MIME mismatch for document ${documentId}: declared=${document.mimeType}, detected=${detectedMime}`,
       );
       await this.storage.deleteObject(version.storageKey);
       await this.db.document.update({
@@ -165,7 +185,6 @@ export class DocumentsService {
     const actualSize = meta.ContentLength ?? document.fileSizeBytes;
     const etag = meta.ETag?.replace(/"/g, '') ?? '';
 
-    // Update version with confirmed metadata
     await this.db.documentVersion.update({
       where: { id: versionId },
       data: {
@@ -175,13 +194,11 @@ export class DocumentsService {
       },
     });
 
-    // Update document currentVersionId
     await this.db.document.update({
       where: { id: documentId },
-      data: { currentVersionId: versionId },
+      data: { currentVersionId: versionId, status: DocumentStatus.QUEUED },
     });
 
-    // Create processing job record
     const processingJob = await this.db.processingJob.create({
       data: {
         documentId,
@@ -192,7 +209,6 @@ export class DocumentsService {
       },
     });
 
-    // Enqueue BullMQ job
     const jobId = await this.queue.enqueueDocumentProcessing({
       documentId,
       versionId,
@@ -202,7 +218,6 @@ export class DocumentsService {
       requestId,
     });
 
-    // Link job ID
     await this.db.processingJob.update({
       where: { id: processingJob.id },
       data: { bullJobId: jobId },
@@ -216,10 +231,6 @@ export class DocumentsService {
       documentId,
       requestId,
     });
-
-    this.logger.log(
-      `Upload confirmed and processing enqueued: document=${documentId} job=${jobId}`,
-    );
 
     return {
       documentId,
@@ -267,12 +278,12 @@ export class DocumentsService {
           status: true,
           category: true,
           categoryConfidence: true,
+          categoryOverride: true,
           primaryLanguage: true,
           tags: true,
           createdAt: true,
           updatedAt: true,
           versions: {
-            where: { id: { not: undefined } },
             orderBy: { versionNumber: 'desc' },
             take: 1,
             select: {
@@ -297,7 +308,7 @@ export class DocumentsService {
     };
   }
 
-  // ── Get Document ─────────────────────────────────────────────
+  // ── Get Document Detail ──────────────────────────────────────
 
   async findOne(userId: string, documentId: string) {
     const document = await this.db.document.findFirst({
@@ -309,8 +320,10 @@ export class DocumentsService {
             id: true,
             versionNumber: true,
             pageCount: true,
+            thumbnailStorageKey: true,
             processingStatus: true,
             processingStage: true,
+            notes: true,
             startedAt: true,
             completedAt: true,
             processingDurationMs: true,
@@ -382,24 +395,26 @@ export class DocumentsService {
     };
   }
 
-  // ── Get Pages ─────────────────────────────────────────────
+  // ── Get Pages ────────────────────────────────────────────────
 
-  async getPages(userId: string, documentId: string) {
+  async getPages(userId: string, documentId: string, versionId?: string) {
     const document = await this.db.document.findFirst({
       where: { id: documentId, userId, isDeleted: false },
       select: { id: true },
     });
     if (!document) throw new NotFoundException('Document not found');
 
-    const version = await this.db.documentVersion.findFirst({
-      where: { documentId },
-      orderBy: { versionNumber: 'desc' },
-      select: { id: true },
-    });
-    if (!version) return { pages: [] };
+    const targetVersion = versionId
+      ? await this.db.documentVersion.findFirst({ where: { id: versionId, documentId } })
+      : await this.db.documentVersion.findFirst({
+          where: { documentId },
+          orderBy: { versionNumber: 'desc' },
+        });
+
+    if (!targetVersion) return { documentId, pages: [] };
 
     const pages = await this.db.documentPage.findMany({
-      where: { versionId: version.id },
+      where: { versionId: targetVersion.id },
       orderBy: { pageNumber: 'asc' },
       select: {
         id: true,
@@ -412,32 +427,54 @@ export class DocumentsService {
       },
     });
 
-    return { documentId, pages };
+    // Generate presigned URLs for page images
+    const pagesWithUrls = await Promise.all(
+      pages.map(async (p: (typeof pages)[number]) => {
+        let imageUrl: string | null = null;
+        try {
+          imageUrl = await this.storage.createPresignedDownloadUrl(p.storageKey, 3600);
+        } catch {
+          // ignore
+        }
+        return { ...p, imageUrl };
+      }),
+    );
+
+    return { documentId, versionId: targetVersion.id, pages: pagesWithUrls };
   }
 
   // ── Get Page Detail ──────────────────────────────────────────
 
-  async getPage(userId: string, documentId: string, pageNum: number) {
+  async getPage(userId: string, documentId: string, pageNum: number, versionId?: string) {
     const document = await this.db.document.findFirst({
       where: { id: documentId, userId, isDeleted: false },
       select: { id: true },
     });
     if (!document) throw new NotFoundException('Document not found');
 
-    const version = await this.db.documentVersion.findFirst({
-      where: { documentId },
-      orderBy: { versionNumber: 'desc' },
-      select: { id: true },
-    });
-    if (!version) throw new NotFoundException('No version found');
+    const targetVersion = versionId
+      ? await this.db.documentVersion.findFirst({ where: { id: versionId, documentId } })
+      : await this.db.documentVersion.findFirst({
+          where: { documentId },
+          orderBy: { versionNumber: 'desc' },
+        });
+
+    if (!targetVersion) throw new NotFoundException('No version found');
 
     const page = await this.db.documentPage.findUnique({
-      where: { versionId_pageNumber: { versionId: version.id, pageNumber: pageNum } },
+      where: { versionId_pageNumber: { versionId: targetVersion.id, pageNumber: pageNum } },
     });
     if (!page) throw new NotFoundException(`Page ${pageNum} not found`);
 
+    let imageUrl: string | null = null;
+    try {
+      imageUrl = await this.storage.createPresignedDownloadUrl(page.storageKey, 3600);
+    } catch {
+      // ignore
+    }
+
     const ocrResult = await this.db.ocrResult.findFirst({
-      where: { versionId: version.id, pageNumber: pageNum },
+      where: { versionId: targetVersion.id, pageNumber: pageNum },
       select: {
         id: true,
         pageNumber: true,
@@ -451,7 +488,7 @@ export class DocumentsService {
       },
     });
 
-    return { documentId, page, ocrResult };
+    return { documentId, page: { ...page, imageUrl }, ocrResult };
   }
 
   // ── Get Extracted Fields ─────────────────────────────────────
@@ -463,6 +500,7 @@ export class DocumentsService {
         id: true,
         category: true,
         categoryConfidence: true,
+        categoryOverride: true,
       },
     });
     if (!document) throw new NotFoundException('Document not found');
@@ -487,15 +525,14 @@ export class DocumentsService {
       },
     });
 
-    // Calculate overall document confidence
-    const overallConfidence = fields.length > 0
-      ? fields.reduce((sum, f) => sum + f.confidence, 0) / fields.length
-      : null;
+    const overallConfidence =
+      fields.length > 0 ? fields.reduce((sum, f) => sum + f.confidence, 0) / fields.length : null;
 
     return {
       documentId,
       category: document.category,
       categoryConfidence: document.categoryConfidence,
+      categoryOverride: document.categoryOverride,
       overallConfidence,
       fields,
     };
@@ -503,22 +540,24 @@ export class DocumentsService {
 
   // ── Get Raw OCR ──────────────────────────────────────────────
 
-  async getOcr(userId: string, documentId: string) {
+  async getOcr(userId: string, documentId: string, versionId?: string) {
     const document = await this.db.document.findFirst({
       where: { id: documentId, userId, isDeleted: false },
       select: { id: true },
     });
     if (!document) throw new NotFoundException('Document not found');
 
-    const version = await this.db.documentVersion.findFirst({
-      where: { documentId },
-      orderBy: { versionNumber: 'desc' },
-      select: { id: true },
-    });
-    if (!version) return { documentId, pages: [] };
+    const targetVersion = versionId
+      ? await this.db.documentVersion.findFirst({ where: { id: versionId, documentId } })
+      : await this.db.documentVersion.findFirst({
+          where: { documentId },
+          orderBy: { versionNumber: 'desc' },
+        });
+
+    if (!targetVersion) return { documentId, pages: [] };
 
     const ocrResults = await this.db.ocrResult.findMany({
-      where: { versionId: version.id },
+      where: { versionId: targetVersion.id },
       orderBy: { pageNumber: 'asc' },
       select: {
         id: true,
@@ -529,11 +568,313 @@ export class DocumentsService {
         pageLanguage: true,
         ocrProvider: true,
         fallbackUsed: true,
+        fallbackProvider: true,
         processingTimeMs: true,
       },
     });
 
     return { documentId, pages: ocrResults };
+  }
+
+  // ── Override Document Category (Checkpoint 3) ────────────────
+
+  async overrideCategory(
+    userId: string,
+    documentId: string,
+    dto: OverrideCategoryDto,
+    requestId?: string,
+  ) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+    });
+
+    if (!document) throw new NotFoundException('Document not found');
+
+    const previousCategory = document.category ?? DocumentCategory.UNKNOWN;
+    const previousConfidence = document.categoryConfidence ?? 0.0;
+
+    const updated = await this.db.document.update({
+      where: { id: documentId },
+      data: {
+        category: dto.category,
+        categoryOverride: true,
+      },
+      select: {
+        id: true,
+        category: true,
+        categoryOverride: true,
+        categoryConfidence: true,
+        updatedAt: true,
+      },
+    });
+
+    await this.db.classificationCorrection.upsert({
+      where: { documentId },
+      create: {
+        documentId,
+        aiCategory: previousCategory,
+        aiConfidence: previousConfidence,
+        userCategory: dto.category,
+        reason: dto.reason,
+        correctedByUserId: userId,
+      },
+      update: {
+        userCategory: dto.category,
+        reason: dto.reason,
+      },
+    });
+
+    await this.audit.log({
+      eventType: 'CLASSIFICATION_OVERRIDDEN',
+      actorId: userId,
+      resourceType: 'DOCUMENT',
+      resourceId: documentId,
+      documentId,
+      changes: {
+        previousCategory,
+        newCategory: dto.category,
+        reason: dto.reason,
+      },
+      requestId,
+    });
+
+    this.logger.log(
+      `Document ${documentId} category overridden by ${userId} to ${dto.category}`,
+    );
+
+    return updated;
+  }
+
+  // ── Document Versioning (Checkpoint 3) ───────────────────────
+
+  async getVersions(userId: string, documentId: string) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      select: { id: true },
+    });
+
+    if (!document) throw new NotFoundException('Document not found');
+
+    const versions = await this.db.documentVersion.findMany({
+      where: { documentId },
+      orderBy: { versionNumber: 'asc' },
+      select: {
+        id: true,
+        versionNumber: true,
+        pageCount: true,
+        fileSizeBytes: true,
+        thumbnailStorageKey: true,
+        processingStatus: true,
+        processingStage: true,
+        notes: true,
+        startedAt: true,
+        completedAt: true,
+        processingDurationMs: true,
+        createdAt: true,
+      },
+    });
+
+    return { documentId, versions };
+  }
+
+  async createVersion(
+    userId: string,
+    documentId: string,
+    dto: CreateVersionDto,
+    requestId?: string,
+  ) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      include: {
+        versions: { orderBy: { versionNumber: 'desc' }, take: 1 },
+      },
+    });
+
+    if (!document) throw new NotFoundException('Document not found');
+
+    const nextVersionNumber = (document.versions[0]?.versionNumber ?? 0) + 1;
+    const presignExpiry = this.config.get<number>('MINIO_PRESIGN_EXPIRY_SECONDS', 3600);
+
+    const version = await this.db.documentVersion.create({
+      data: {
+        documentId,
+        versionNumber: nextVersionNumber,
+        uploadedByUserId: userId,
+        storageKey: 'PENDING',
+        notes: dto.notes,
+        fileSizeBytes: dto.fileSize,
+      },
+    });
+
+    const storageKey = generateStorageKey(userId, documentId, version.id, dto.fileName);
+
+    await this.db.documentVersion.update({
+      where: { id: version.id },
+      data: { storageKey },
+    });
+
+    const presignedUpload = await this.storage.createPresignedUpload(
+      storageKey,
+      dto.mimeType,
+      dto.fileSize,
+      presignExpiry,
+    );
+
+    await this.audit.log({
+      eventType: 'DOCUMENT_VERSION_INITIATED',
+      actorId: userId,
+      resourceType: 'DOCUMENT_VERSION',
+      resourceId: version.id,
+      documentId,
+      changes: { versionNumber: nextVersionNumber },
+      requestId,
+    });
+
+    return {
+      documentId,
+      versionId: version.id,
+      versionNumber: nextVersionNumber,
+      uploadUrl: presignedUpload.url,
+      uploadFields: presignedUpload.fields,
+      storageKey,
+      expiresAt: presignedUpload.expiresAt,
+    };
+  }
+
+  async getVersionDetail(userId: string, documentId: string, versionId: string) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      select: { id: true, title: true },
+    });
+
+    if (!document) throw new NotFoundException('Document not found');
+
+    const version = await this.db.documentVersion.findFirst({
+      where: { id: versionId, documentId },
+      include: {
+        pages: { orderBy: { pageNumber: 'asc' } },
+        versionFields: true,
+        ocrResults: true,
+      },
+    });
+
+    if (!version) throw new NotFoundException('Version not found');
+
+    return { document, version };
+  }
+
+  async compareVersions(userId: string, documentId: string, v1Id: string, v2Id: string) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      select: { id: true, title: true, category: true },
+    });
+
+    if (!document) throw new NotFoundException('Document not found');
+
+    const [v1, v2] = await Promise.all([
+      this.db.documentVersion.findFirst({
+        where: { id: v1Id, documentId },
+        include: {
+          versionFields: true,
+          ocrResults: { orderBy: { pageNumber: 'asc' } },
+        },
+      }),
+      this.db.documentVersion.findFirst({
+        where: { id: v2Id, documentId },
+        include: {
+          versionFields: true,
+          ocrResults: { orderBy: { pageNumber: 'asc' } },
+        },
+      }),
+    ]);
+
+    if (!v1 || !v2) {
+      throw new NotFoundException('One or both versions not found for comparison');
+    }
+
+    // ── Field-by-Field Diff ──────────────────────────────────────────
+    const v1FieldsMap = new Map(v1.versionFields.map((f: (typeof v1.versionFields)[number]) => [f.fieldName, f]));
+    const v2FieldsMap = new Map(v2.versionFields.map((f: (typeof v2.versionFields)[number]) => [f.fieldName, f]));
+    const allFieldNames = new Set([...v1FieldsMap.keys(), ...v2FieldsMap.keys()]);
+
+    const fieldDiffs: FieldDiffItem[] = [];
+
+    for (const fieldName of allFieldNames) {
+      const f1 = v1FieldsMap.get(fieldName);
+      const f2 = v2FieldsMap.get(fieldName);
+
+      if (f1 && f2) {
+        if (f1.rawValue.trim() === f2.rawValue.trim()) {
+          fieldDiffs.push({
+            fieldName,
+            status: 'UNCHANGED',
+            v1Value: f1.rawValue,
+            v2Value: f2.rawValue,
+            v1Confidence: f1.confidence,
+            v2Confidence: f2.confidence,
+          });
+        } else {
+          fieldDiffs.push({
+            fieldName,
+            status: 'CHANGED',
+            v1Value: f1.rawValue,
+            v2Value: f2.rawValue,
+            v1Confidence: f1.confidence,
+            v2Confidence: f2.confidence,
+          });
+        }
+      } else if (!f1 && f2) {
+        fieldDiffs.push({
+          fieldName,
+          status: 'ADDED',
+          v1Value: null,
+          v2Value: f2.rawValue,
+          v1Confidence: null,
+          v2Confidence: f2.confidence,
+        });
+      } else if (f1 && !f2) {
+        fieldDiffs.push({
+          fieldName,
+          status: 'REMOVED',
+          v1Value: f1.rawValue,
+          v2Value: null,
+          v1Confidence: f1.confidence,
+          v2Confidence: null,
+        });
+      }
+    }
+
+    // Sort: CHANGED first, then ADDED, REMOVED, UNCHANGED
+    const orderScore: Record<FieldDiffStatus, number> = {
+      CHANGED: 1,
+      ADDED: 2,
+      REMOVED: 3,
+      UNCHANGED: 4,
+    };
+    fieldDiffs.sort((a, b) => orderScore[a.status] - orderScore[b.status]);
+
+    const changedCount = fieldDiffs.filter((d) => d.status === 'CHANGED').length;
+    const addedCount = fieldDiffs.filter((d) => d.status === 'ADDED').length;
+    const removedCount = fieldDiffs.filter((d) => d.status === 'REMOVED').length;
+
+    const summary = `${changedCount} field(s) modified, ${addedCount} field(s) added, ${removedCount} field(s) removed between Version ${v1.versionNumber} and Version ${v2.versionNumber}.`;
+
+    return {
+      documentId,
+      documentTitle: document.title,
+      v1: {
+        id: v1.id,
+        versionNumber: v1.versionNumber,
+        createdAt: v1.createdAt,
+      },
+      v2: {
+        id: v2.id,
+        versionNumber: v2.versionNumber,
+        createdAt: v2.createdAt,
+      },
+      summary,
+      fieldDiffs,
+    };
   }
 
   // ── Update Document ──────────────────────────────────────────────
@@ -564,7 +905,6 @@ export class DocumentsService {
 
     if (!document) throw new NotFoundException('Document not found');
 
-    // Soft delete
     await this.db.document.update({
       where: { id: documentId },
       data: { isDeleted: true, deletedAt: new Date() },
@@ -617,11 +957,9 @@ export class DocumentsService {
       const buffer = Buffer.from(await response.arrayBuffer());
       if (buffer.length < 4) return null;
 
-      // PDF: %PDF
       if (buffer.subarray(0, 4).toString() === '%PDF') {
         return 'application/pdf';
       }
-      // PNG: 89 50 4E 47 0D 0A 1A 0A
       if (
         buffer[0] === 0x89 &&
         buffer[1] === 0x50 &&
@@ -630,11 +968,9 @@ export class DocumentsService {
       ) {
         return 'image/png';
       }
-      // JPEG: FF D8 FF
       if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
         return 'image/jpeg';
       }
-      // WebP: RIFF....WEBP
       if (
         buffer.subarray(0, 4).toString() === 'RIFF' &&
         buffer.length >= 12 &&
@@ -645,7 +981,6 @@ export class DocumentsService {
 
       return null;
     } catch {
-      // If detection fails, don't block the upload
       return null;
     }
   }

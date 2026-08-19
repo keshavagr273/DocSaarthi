@@ -39,13 +39,16 @@ const ENGLISH_MONTHS: Record<string, number> = {
 };
 
 /**
- * Stage 11: VALIDATION
+ * Stage 11: VALIDATION & CROSS-FIELD CONSISTENCY
  *
- * Per-field type validation:
- * - DATE: attempt multi-format parsing, store normalizedValue as ISO date
- * - CURRENCY: strip symbols, verify numeric
- * - ID_NUMBER GSTIN: validate 15-char pattern
- * - Date logic: deadline before issue_date → flag as LOW confidence
+ * Checkpoint 3 enhancements:
+ * - Date parsing (standard formats + Hindi Devanagari dates)
+ * - Currency normalization + anomaly detection (negatives, >10Cr)
+ * - GSTIN 15-character validation with confidence adjustments
+ * - Cross-field consistency:
+ *   - Invoice math verification: subtotal + tax_amount ≈ total_amount (within 5%)
+ *   - Chronological validation: deadline/due_date >= issue_date
+ *   - Certificate validity: expiry_date >= issue_date
  */
 @Injectable()
 export class ValidationStage extends BaseStage {
@@ -68,13 +71,14 @@ export class ValidationStage extends BaseStage {
       where: { documentId: ctx.documentId, isRejected: false },
     });
 
-    // Store parsed dates for cross-field validation
     const parsedDates: Record<string, Date | null> = {};
+    const parsedCurrencies: Record<string, number | null> = {};
 
     for (const field of dbFields) {
       let newConfidence = field.confidence;
       let normalizedValue: unknown = null;
 
+      // ── 1. Date Validation ─────────────────────────────────────────
       if (field.fieldType === 'DATE') {
         const parsed = this.parseDate(field.rawValue);
         if (parsed) {
@@ -84,15 +88,30 @@ export class ValidationStage extends BaseStage {
           newConfidence = Math.min(field.confidence, 0.40);
           parsedDates[field.fieldName] = null;
         }
-      } else if (field.fieldType === 'CURRENCY') {
+      }
+
+      // ── 2. Currency Validation ─────────────────────────────────────
+      else if (field.fieldType === 'CURRENCY') {
         const numeric = this.parseCurrency(field.rawValue);
         if (numeric !== null) {
           normalizedValue = numeric;
+          parsedCurrencies[field.fieldName] = numeric;
+
+          // Check anomalies
+          if (numeric < 0) {
+            newConfidence = Math.max(0.1, newConfidence - 0.25);
+          } else if (numeric > 100_000_000) {
+            // Unusually large (> 10 Crore) — mark for human review
+            newConfidence = Math.min(newConfidence, 0.60);
+          }
         } else {
           newConfidence = Math.min(field.confidence, 0.40);
+          parsedCurrencies[field.fieldName] = null;
         }
-      } else if (field.fieldType === 'ID_NUMBER') {
-        // GSTIN validation
+      }
+
+      // ── 3. ID / GSTIN Validation ───────────────────────────────────
+      else if (field.fieldType === 'ID_NUMBER' || field.fieldName.includes('gstin')) {
         if (this.looksLikeGstin(field.rawValue)) {
           if (this.isValidGstin(field.rawValue)) {
             newConfidence = Math.min(1.0, field.confidence + 0.1);
@@ -103,19 +122,22 @@ export class ValidationStage extends BaseStage {
         }
       }
 
-      // Update field in DB
+      const clampedConfidence = Math.min(1.0, Math.max(0.0, newConfidence));
+      const confidenceLevel = this.toLevel(clampedConfidence);
+
       await this.db.documentField.update({
         where: { id: field.id },
         data: {
-          normalizedValue: normalizedValue ?? undefined,
-          confidence: newConfidence,
-          confidenceLevel: this.toLevel(newConfidence) as never,
+          normalizedValue: normalizedValue !== null ? (normalizedValue as never) : undefined,
+          confidence: clampedConfidence,
+          confidenceLevel: confidenceLevel as never,
         },
       });
     }
 
-    // Cross-field validation: deadline should be after issue_date
+    // ── 4. Cross-Field Validations ──────────────────────────────────
     await this.crossValidateDates(ctx.documentId, parsedDates);
+    await this.crossValidateInvoiceMath(ctx.documentId, parsedCurrencies);
 
     await this.markStageCompleted(ctx.versionId);
     this.logger.log(`[${ctx.documentId}] Stage 11 DONE — validated ${dbFields.length} fields`);
@@ -154,12 +176,18 @@ export class ValidationStage extends BaseStage {
   }
 
   private parseNaturalDate(s: string): Date | null {
-    // "20 August 2026" or "20 Aug 2026"
+    // "20 August 2026" or "20 Aug 2026" or "Aug 20, 2026"
     const m = s.match(/^(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})$/i);
-    if (!m) return null;
-    const monthNum = ENGLISH_MONTHS[m[2]!.toLowerCase()];
-    if (!monthNum) return null;
-    return new Date(parseInt(m[3]!), monthNum - 1, parseInt(m[1]!));
+    if (m) {
+      const monthNum = ENGLISH_MONTHS[m[2]!.toLowerCase()];
+      if (monthNum) return new Date(parseInt(m[3]!), monthNum - 1, parseInt(m[1]!));
+    }
+    const m2 = s.match(/^([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{4})$/i);
+    if (m2) {
+      const monthNum = ENGLISH_MONTHS[m2[1]!.toLowerCase()];
+      if (monthNum) return new Date(parseInt(m2[3]!), monthNum - 1, parseInt(m2[2]!));
+    }
+    return null;
   }
 
   private parseHindiDate(s: string): Date | null {
@@ -178,8 +206,7 @@ export class ValidationStage extends BaseStage {
   // ── Currency parsing ─────────────────────────────────────────────
 
   private parseCurrency(raw: string): number | null {
-    // Strip Rs., ₹, commas, spaces
-    const cleaned = raw.replace(/Rs\.?\s*|₹\s*|,/g, '').trim();
+    const cleaned = raw.replace(/INR|Rs\.?|₹|\s|,/gi, '').trim();
     const num = parseFloat(cleaned);
     return isNaN(num) ? null : num;
   }
@@ -187,7 +214,8 @@ export class ValidationStage extends BaseStage {
   // ── GSTIN validation ─────────────────────────────────────────────
 
   private looksLikeGstin(raw: string): boolean {
-    return /[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}/.test(raw.toUpperCase().trim());
+    const cleaned = raw.toUpperCase().trim();
+    return /[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}/.test(cleaned);
   }
 
   private isValidGstin(raw: string): boolean {
@@ -195,7 +223,7 @@ export class ValidationStage extends BaseStage {
     return GSTIN_REGEX.test(raw.toUpperCase().trim());
   }
 
-  // ── Cross-field date validation ───────────────────────────────────
+  // ── Cross-field Date Validation ───────────────────────────────────
 
   private async crossValidateDates(
     documentId: string,
@@ -204,23 +232,59 @@ export class ValidationStage extends BaseStage {
     const issueDate = parsedDates['issue_date'] ?? parsedDates['invoice_date'] ?? parsedDates['date'];
     const deadline = parsedDates['deadline'] ?? parsedDates['payment_due_date'] ?? parsedDates['expiry_date'];
 
-    if (issueDate && deadline && deadline <= issueDate) {
+    if (issueDate && deadline && deadline < issueDate) {
       this.logger.warn(
-        `[${documentId}] Cross-validation: deadline (${deadline.toISOString()}) is before issue_date (${issueDate.toISOString()})`,
+        `[${documentId}] Chronological conflict: deadline (${deadline.toISOString()}) is before issue date (${issueDate.toISOString()})`,
       );
 
-      // Reduce deadline confidence
-      const deadlineFieldName = parsedDates['deadline'] ? 'deadline'
-        : parsedDates['payment_due_date'] ? 'payment_due_date'
+      const targetField = parsedDates['deadline']
+        ? 'deadline'
+        : parsedDates['payment_due_date']
+        ? 'payment_due_date'
         : 'expiry_date';
 
       await this.db.documentField.updateMany({
-        where: { documentId, fieldName: deadlineFieldName },
+        where: { documentId, fieldName: targetField },
         data: {
-          confidence: 0.40,
+          confidence: 0.35,
           confidenceLevel: 'LOW',
         },
       });
+    }
+  }
+
+  // ── Cross-field Invoice Math Validation ──────────────────────────
+
+  private async crossValidateInvoiceMath(
+    documentId: string,
+    parsedCurrencies: Record<string, number | null>,
+  ): Promise<void> {
+    const subtotal = parsedCurrencies['subtotal'];
+    const tax = parsedCurrencies['tax_amount'];
+    const total = parsedCurrencies['total_amount'];
+
+    if (subtotal !== null && subtotal !== undefined && tax !== null && tax !== undefined && total !== null && total !== undefined) {
+      const expectedTotal = subtotal + tax;
+      const difference = Math.abs(expectedTotal - total);
+      const tolerance = total * 0.05; // 5% rounding / discount tolerance
+
+      if (difference > tolerance && difference > 5) {
+        this.logger.warn(
+          `[${documentId}] Invoice math mismatch: subtotal(${subtotal}) + tax(${tax}) = ${expectedTotal} != total(${total})`,
+        );
+
+        // Reduce confidence of total_amount and tax_amount
+        await this.db.documentField.updateMany({
+          where: {
+            documentId,
+            fieldName: { in: ['total_amount', 'tax_amount'] },
+          },
+          data: {
+            confidence: 0.45,
+            confidenceLevel: 'LOW',
+          },
+        });
+      }
     }
   }
 

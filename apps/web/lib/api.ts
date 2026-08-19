@@ -21,7 +21,6 @@ api.interceptors.response.use(
 
     if (error.response?.status === 401 && !originalRequest._retry) {
       if (isRefreshing) {
-        // Queue this request until refresh completes
         return new Promise((resolve) => {
           refreshQueue.push(() => {
             originalRequest._retry = true;
@@ -39,7 +38,6 @@ api.interceptors.response.use(
         refreshQueue = [];
         return api(originalRequest);
       } catch {
-        // Refresh failed — redirect to login
         refreshQueue = [];
         if (typeof window !== 'undefined') {
           window.location.href = '/login';
@@ -76,8 +74,8 @@ export const documentsApi = {
     mimeType: string;
     fileSize: number;
     title?: string;
-  }) =>
-    api.post<{ data: PresignedUploadResponse }>('/documents', data),
+    tags?: string[];
+  }) => api.post<{ data: PresignedUploadResponse }>('/documents', data),
 
   confirmUpload: (documentId: string, versionId: string) =>
     api.post<{ data: { documentId: string; status: string; message: string } }>(
@@ -104,25 +102,69 @@ export const documentsApi = {
   getFields: (documentId: string) =>
     api.get<{ data: DocumentFieldsResponse }>(`/documents/${documentId}/fields`),
 
-  getPages: (documentId: string) =>
-    api.get<{ data: { documentId: string; pages: DocumentPage[] } }>(
+  getPages: (documentId: string, versionId?: string) =>
+    api.get<{ data: { documentId: string; versionId: string; pages: DocumentPage[] } }>(
       `/documents/${documentId}/pages`,
+      { params: { versionId } },
     ),
 
-  getPage: (documentId: string, pageNum: number) =>
+  getPage: (documentId: string, pageNum: number, versionId?: string) =>
     api.get<{ data: { documentId: string; page: DocumentPage; ocrResult: OcrResult | null } }>(
       `/documents/${documentId}/pages/${pageNum}`,
+      { params: { versionId } },
     ),
 
-  getOcr: (documentId: string) =>
+  getOcr: (documentId: string, versionId?: string) =>
     api.get<{ data: { documentId: string; pages: OcrResult[] } }>(
       `/documents/${documentId}/ocr`,
+      { params: { versionId } },
     ),
+
+  overrideCategory: (documentId: string, data: { category: string; reason?: string }) =>
+    api.patch<{ data: { id: string; category: string; categoryOverride: boolean } }>(
+      `/documents/${documentId}/category`,
+      data,
+    ),
+
+  getVersions: (documentId: string) =>
+    api.get<{ data: { documentId: string; versions: DocumentVersionInfo[] } }>(
+      `/documents/${documentId}/versions`,
+    ),
+
+  createVersion: (
+    documentId: string,
+    data: { fileName: string; mimeType: string; fileSize: number; notes?: string },
+  ) => api.post<{ data: PresignedUploadResponse & { versionNumber: number } }>(
+    `/documents/${documentId}/versions`,
+    data,
+  ),
+
+  compareVersions: (documentId: string, v1: string, v2: string) =>
+    api.get<{ data: VersionCompareResponse }>(`/documents/${documentId}/versions/compare`, {
+      params: { v1, v2 },
+    }),
 
   update: (documentId: string, data: { title?: string; tags?: string[] }) =>
     api.patch<{ data: Document }>(`/documents/${documentId}`, data),
 
   delete: (documentId: string) => api.delete(`/documents/${documentId}`),
+};
+
+export const reviewApi = {
+  getQueue: (params?: { page?: number; limit?: number; category?: string; search?: string }) =>
+    api.get<{ data: ReviewQueueResponse }>('/review', { params }),
+
+  getStats: () =>
+    api.get<{ data: ReviewStats }>('/review/stats'),
+
+  accept: (fieldId: string) =>
+    api.post<{ data: DocumentField }>(`/review/fields/${fieldId}/accept`),
+
+  edit: (fieldId: string, data: { newValue: string; reason?: string }) =>
+    api.post<{ data: DocumentField }>(`/review/fields/${fieldId}/edit`, data),
+
+  reject: (fieldId: string, data?: { reason?: string }) =>
+    api.post<{ data: DocumentField }>(`/review/fields/${fieldId}/reject`, data ?? {}),
 };
 
 // ── Types ─────────────────────────────────────────────────────
@@ -155,6 +197,7 @@ export interface Document {
   status: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'NEEDS_REVIEW';
   category: string | null;
   categoryConfidence: number | null;
+  categoryOverride?: boolean;
   primaryLanguage: string | null;
   tags: string[];
   createdAt: string;
@@ -167,22 +210,29 @@ export interface Document {
   } | null;
 }
 
+export interface DocumentVersionInfo {
+  id: string;
+  versionNumber: number;
+  pageCount: number | null;
+  fileSizeBytes: number | null;
+  thumbnailStorageKey: string | null;
+  processingStatus: string;
+  processingStage: string;
+  notes: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  processingDurationMs: number | null;
+  createdAt: string;
+}
+
 export interface DocumentDetail extends Document {
-  versions: Array<{
-    id: string;
-    versionNumber: number;
-    pageCount: number | null;
-    processingStatus: string;
-    processingStage: string;
-    startedAt: string | null;
-    completedAt: string | null;
-    processingDurationMs: number | null;
-  }>;
+  versions: DocumentVersionInfo[];
   fields: DocumentField[];
 }
 
 export interface DocumentField {
   id: string;
+  documentId?: string;
   fieldName: string;
   fieldType: string;
   rawValue: string;
@@ -190,7 +240,7 @@ export interface DocumentField {
   confidence: number;
   confidenceLevel: 'HIGH' | 'MEDIUM' | 'LOW';
   sourcePage: number | null;
-  sourceBbox: unknown;
+  sourceBbox: [number, number, number, number] | null;
   isVerified: boolean;
   isRejected: boolean;
   extractionMethod: string | null;
@@ -201,6 +251,7 @@ export interface DocumentFieldsResponse {
   documentId: string;
   category: string | null;
   categoryConfidence: number | null;
+  categoryOverride?: boolean;
   overallConfidence: number | null;
   fields: DocumentField[];
 }
@@ -209,6 +260,7 @@ export interface DocumentPage {
   id: string;
   pageNumber: number;
   storageKey: string;
+  imageUrl?: string | null;
   width: number | null;
   height: number | null;
   language: string | null;
@@ -233,6 +285,7 @@ export interface OcrResult {
   pageLanguage: string;
   ocrProvider: string;
   fallbackUsed: boolean;
+  fallbackProvider?: string | null;
   processingTimeMs: number | null;
 }
 
@@ -253,4 +306,43 @@ export interface DocumentProcessingStatus {
   completedAt: string | null;
   error: { message: string; code: string | null } | null;
   retryCount: number;
+}
+
+export interface ReviewFieldItem extends DocumentField {
+  document: {
+    id: string;
+    title: string;
+    originalFileName: string;
+    category: string | null;
+    createdAt: string;
+  };
+}
+
+export interface ReviewQueueResponse {
+  fields: ReviewFieldItem[];
+  pagination: { total: number; page: number; limit: number; totalPages: number };
+}
+
+export interface ReviewStats {
+  pendingCount: number;
+  verifiedCount: number;
+  rejectedCount: number;
+}
+
+export interface FieldDiffItem {
+  fieldName: string;
+  status: 'UNCHANGED' | 'CHANGED' | 'ADDED' | 'REMOVED';
+  v1Value: string | null;
+  v2Value: string | null;
+  v1Confidence: number | null;
+  v2Confidence: number | null;
+}
+
+export interface VersionCompareResponse {
+  documentId: string;
+  documentTitle: string;
+  v1: { id: string; versionNumber: number; createdAt: string };
+  v2: { id: string; versionNumber: number; createdAt: string };
+  summary: string;
+  fieldDiffs: FieldDiffItem[];
 }

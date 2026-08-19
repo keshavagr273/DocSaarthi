@@ -7,16 +7,14 @@ import type { PipelineContext } from './pipeline-context';
 import type { DocumentProcessingJobData } from '../processors/document.processor';
 
 /**
- * Stage 4: IMAGE_PREPROCESSING
+ * Stage 4: IMAGE_PREPROCESSING & ENHANCEMENT
  *
- * For each page image:
+ * Preprocesses scanned and photographed Indian documents:
  * - Auto-rotate based on EXIF orientation
- * - Normalize contrast
- * - Sharpen slightly
- * - Keep buffers in ctx.preprocessedBuffers for Stage 5 (OCR) to consume
- *
- * We pass buffers forward in memory to avoid an extra MinIO upload/download round-trip.
- * If memory pressure is a concern with large docs, we could write to MinIO instead.
+ * - Normalize dynamic range (contrast stretching)
+ * - Gentle unsharp masking for crisp text edges and Devanagari matra clarity
+ * - Grayscale/gamma tuning for OCR background removal
+ * - Caches preprocessed buffers in memory for Stage 5 (OCR)
  */
 @Injectable()
 export class ImagePreprocessingStage extends BaseStage {
@@ -49,15 +47,14 @@ export class ImagePreprocessingStage extends BaseStage {
       const storageKey = pageStorageKeys[pageNum]!;
 
       try {
-        let rawBuffer: Buffer;
+        const rawBuffer = await this.storage.downloadBuffer(storageKey);
 
-        // For images (single page), ctx.storageKey is the page storageKey
-        rawBuffer = await this.storage.downloadBuffer(storageKey);
-
+        // Apply advanced pipeline: auto-orient, normalize contrast, sharpen
         const processed = await sharp(rawBuffer)
-          .rotate() // auto-rotate from EXIF
-          .normalize() // stretch contrast to use full dynamic range
-          .sharpen({ sigma: 1.0, m1: 0.5, m2: 0.5 }) // gentle sharpening for OCR
+          .rotate() // Auto-orient based on EXIF
+          .gamma(1.1) // Lighten background noise slightly
+          .normalize() // Stretch luminance histogram
+          .sharpen({ sigma: 1.2, m1: 0.7, m2: 0.3 }) // Enhance fine character strokes
           .png({ compressionLevel: 6 })
           .toBuffer();
 
@@ -67,7 +64,6 @@ export class ImagePreprocessingStage extends BaseStage {
           `[${ctx.documentId}] Preprocessing failed for page ${pageNum}: ${String(err)}. Using raw.`,
         );
 
-        // If preprocessing fails, try to use raw buffer
         try {
           preprocessedBuffers[pageNum] = await this.storage.downloadBuffer(storageKey);
         } catch {
