@@ -6,7 +6,7 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useState } from 'react';
-import { Eye, EyeOff, Mail, Lock, Loader2, FileText, AlertCircle } from 'lucide-react';
+import { Eye, EyeOff, Mail, Lock, Loader2, AlertCircle, ArrowRight } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { authApi } from '../../../lib/api';
 import { cn } from '../../../lib/utils';
@@ -45,52 +45,48 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4 py-12">
-      {/* Background glow */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute top-1/3 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-brand-600/10 blur-3xl" />
-      </div>
+    <div className="min-h-screen bg-[#050508] flex items-center justify-center px-4 py-12 relative overflow-hidden">
+      {/* ── Visuvate Ambient Cosmic Glow ────────────────────────────── */}
+      <div className="absolute top-1/3 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[650px] h-[380px] bg-gradient-to-b from-blue-600/20 via-indigo-600/10 to-transparent blur-[120px] rounded-full pointer-events-none -z-0" />
+      <div className="absolute bottom-[-100px] right-[-100px] w-[400px] h-[300px] bg-cyan-500/10 blur-[100px] rounded-full pointer-events-none -z-0" />
 
-      <div className="relative w-full max-w-md animate-slide-up">
-        {/* Logo */}
-        <div className="flex items-center justify-center gap-3 mb-8">
-          <div className="w-12 h-12 rounded-2xl overflow-hidden border border-brand-500/30 bg-surface-100 shadow-xl shadow-brand-500/10">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src="/logo.png" alt="DocSaarthi Logo" className="w-full h-full object-cover" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold text-gradient">DocSaarthi</h1>
-            <p className="text-xs text-white/40 -mt-0.5">दस्तावेज़ सारथी — Document Intelligence</p>
-          </div>
+      <div className="relative w-full max-w-md animate-slide-up z-10">
+        {/* Brand Header */}
+        <div className="flex flex-col items-center text-center mb-8">
+          <Link href="/" className="inline-flex items-center gap-2 mb-4 group">
+            <div className="w-9 h-9 rounded-full bg-white text-black flex items-center justify-center font-bold text-sm shadow-xl transition-transform group-hover:scale-105">
+              DS
+            </div>
+            <span className="font-bold text-lg text-white tracking-tight">DocSaarthi</span>
+          </Link>
+          <h1 className="text-3xl font-extrabold tracking-tight text-white">
+            Welcome <span className="font-serif italic font-normal text-white/90">Back.</span>
+          </h1>
+          <p className="text-xs text-white/40 mt-1 font-medium">Enter your credentials to access the workspace</p>
         </div>
 
-        {/* Card */}
-        <div className="glass p-8">
-          <div className="mb-6">
-            <h2 className="text-xl font-bold text-white">Welcome back</h2>
-            <p className="text-white/50 text-sm mt-1">Sign in to your account</p>
-          </div>
-
+        {/* Visuvate Floating Glass Card */}
+        <div className="glass-card p-8 sm:p-9 rounded-[28px] border border-white/10 shadow-2xl bg-[#090a10]/80 backdrop-blur-2xl">
           {/* Server error */}
           {serverError && (
-            <div className="mb-4 p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 flex items-start gap-2.5">
+            <div className="mb-5 p-3.5 rounded-2xl bg-red-500/10 border border-red-500/30 flex items-start gap-2.5">
               <AlertCircle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
-              <p className="text-red-300 text-sm">{serverError}</p>
+              <p className="text-red-300 text-xs font-medium">{serverError}</p>
             </div>
           )}
 
           <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
             {/* Email */}
             <div>
-              <label className="label" htmlFor="email">Email address</label>
+              <label className="label" htmlFor="email">Email Address</label>
               <div className="relative">
-                <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-white/30" />
+                <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/30" />
                 <input
                   id="email"
                   type="email"
                   autoComplete="email"
-                  placeholder="you@example.com"
-                  className={cn('input pl-10', errors.email && 'input-error')}
+                  placeholder="name@company.com"
+                  className={cn('input pl-11', errors.email && 'input-error')}
                   {...register('email')}
                 />
               </div>
@@ -103,25 +99,25 @@ export default function LoginPage() {
             <div>
               <div className="flex items-center justify-between mb-1.5">
                 <label className="label mb-0" htmlFor="password">Password</label>
-                <Link href="/forgot-password" className="text-xs text-brand-400 hover:text-brand-300 transition-colors">
+                <Link href="/forgot-password" className="text-xs text-white/40 hover:text-white transition-colors">
                   Forgot password?
                 </Link>
               </div>
               <div className="relative">
-                <Lock className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-white/30" />
+                <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/30" />
                 <input
                   id="password"
                   type={showPassword ? 'text' : 'password'}
                   autoComplete="current-password"
                   placeholder="••••••••"
-                  className={cn('input pl-10 pr-10', errors.password && 'input-error')}
+                  className={cn('input pl-11 pr-11', errors.password && 'input-error')}
                   {...register('password')}
                 />
                 <button
                   type="button"
                   tabIndex={-1}
                   onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60 transition-colors"
+                  className="absolute right-4 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60 transition-colors"
                 >
                   {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
@@ -131,26 +127,27 @@ export default function LoginPage() {
               )}
             </div>
 
-            {/* Submit */}
+            {/* Submit Button */}
             <button
               type="submit"
               disabled={isSubmitting}
-              className="btn-primary w-full mt-2 py-3"
+              className="btn-pill-white w-full mt-4 py-3.5 text-xs font-bold tracking-wide shadow-xl shadow-white/10"
             >
               {isSubmitting ? (
-                <><Loader2 className="w-4 h-4 animate-spin" />Signing in...</>
+                <><Loader2 className="w-4 h-4 animate-spin mr-2" /> Authenticating...</>
               ) : (
-                'Sign in'
+                <>Sign In to Workspace <ArrowRight className="w-3.5 h-3.5 ml-1" /></>
               )}
             </button>
           </form>
 
-          <p className="mt-6 text-center text-sm text-white/40">
+          {/* Switch to Register */}
+          <div className="mt-6 pt-5 border-t border-white/[0.06] text-center text-xs text-white/40">
             Don&apos;t have an account?{' '}
-            <Link href="/register" className="text-brand-400 hover:text-brand-300 font-medium transition-colors">
-              Create account
+            <Link href="/register" className="text-white hover:underline font-semibold transition-colors ml-1">
+              Create an account
             </Link>
-          </p>
+          </div>
         </div>
       </div>
     </div>

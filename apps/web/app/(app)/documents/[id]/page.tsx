@@ -32,6 +32,13 @@ import {
   UploadCloud,
   Sparkles,
   MessageSquare,
+  Download,
+  Copy,
+  Code,
+  FileSpreadsheet,
+  Search,
+  CheckCheck,
+  FileCode,
 } from 'lucide-react';
 import {
   documentsApi,
@@ -281,6 +288,9 @@ export default function DocumentDetailPage({
             </button>
           )}
 
+          {/* Export Dropdown */}
+          <ExportDropdown doc={doc} fields={doc.fields ?? []} />
+
           {/* Chat with Document */}
           <Link
             href={`/documents/${documentId}/chat`}
@@ -366,6 +376,9 @@ function DocumentMainView({
   const [currentPageNum, setCurrentPageNum] = useState(1);
   const [showOcrBoxes, setShowOcrBoxes] = useState(true);
   const [zoomLevel, setZoomLevel] = useState(100);
+  const [viewMode, setViewMode] = useState<'visual' | 'text' | 'json'>('visual');
+  const [textSearch, setTextSearch] = useState('');
+  const [copiedText, setCopiedText] = useState(false);
 
   // Fetch pages with URLs
   const { data: pagesData } = useQuery({
@@ -384,10 +397,22 @@ function DocumentMainView({
   const totalPages = pages.length || 1;
   const currentPage = pages.find((p) => p.pageNumber === currentPageNum);
   const ocrBlocks = pageDetail?.ocrResult?.blocks ?? [];
+  const rawPageText = pageDetail?.ocrResult?.rawText || ocrBlocks.map((b) => b.text).join('\n');
 
   const fields = doc.fields ?? [];
   const overallConfidence =
     fields.length > 0 ? fields.reduce((s, f) => s + f.confidence, 0) / fields.length : 0;
+
+  const handleCopyPageText = () => {
+    if (!rawPageText) return;
+    navigator.clipboard.writeText(rawPageText);
+    setCopiedText(true);
+    toast.success(`Copied Page ${currentPageNum} text!`);
+    setTimeout(() => setCopiedText(false), 2000);
+  };
+
+  const wordCount = rawPageText.trim() ? rawPageText.trim().split(/\s+/).length : 0;
+  const charCount = rawPageText.length;
 
   return (
     <div className="space-y-6">
@@ -436,135 +461,283 @@ function DocumentMainView({
 
       {/* Two-panel Grid: Left = Document Viewer / OCR, Right = Fields */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left Panel: Document Viewer */}
+        {/* Left Panel: Document Viewer & Raw Text */}
         <div className="lg:col-span-7 glass p-5 rounded-2xl space-y-4">
-          {/* Controls Bar */}
+          {/* Top Mode Tabs & Controls Bar */}
           <div className="flex items-center justify-between flex-wrap gap-2 pb-3 border-b border-white/[0.06]">
-            {/* Page Navigation */}
-            <div className="flex items-center gap-2">
+            {/* View Mode Selector */}
+            <div className="flex items-center p-0.5 bg-white/[0.04] border border-white/[0.08] rounded-xl">
               <button
-                disabled={currentPageNum <= 1}
-                onClick={() => setCurrentPageNum((p) => Math.max(1, p - 1))}
-                className="p-1.5 rounded-lg border border-white/[0.08] text-white/60 hover:text-white disabled:opacity-30 transition-colors"
-              >
-                <ChevronLeft className="w-3.5 h-3.5" />
-              </button>
-              <span className="text-xs font-semibold text-white/80">
-                Page {currentPageNum} of {totalPages}
-              </span>
-              <button
-                disabled={currentPageNum >= totalPages}
-                onClick={() => setCurrentPageNum((p) => Math.min(totalPages, p + 1))}
-                className="p-1.5 rounded-lg border border-white/[0.08] text-white/60 hover:text-white disabled:opacity-30 transition-colors"
-              >
-                <ChevronRight className="w-3.5 h-3.5" />
-              </button>
-            </div>
-
-            {/* OCR Toggle & Zoom */}
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowOcrBoxes(!showOcrBoxes)}
+                onClick={() => setViewMode('visual')}
                 className={cn(
-                  'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors',
-                  showOcrBoxes
-                    ? 'bg-brand-600/20 text-brand-300 border-brand-500/30'
-                    : 'bg-white/[0.04] text-white/50 border-white/[0.06] hover:text-white',
+                  'flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition-colors',
+                  viewMode === 'visual'
+                    ? 'bg-brand-600 text-white shadow'
+                    : 'text-white/50 hover:text-white',
                 )}
               >
-                {showOcrBoxes ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
-                OCR Overlay
+                <Eye className="w-3.5 h-3.5" /> Visual
               </button>
+              <button
+                onClick={() => setViewMode('text')}
+                className={cn(
+                  'flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition-colors',
+                  viewMode === 'text'
+                    ? 'bg-brand-600 text-white shadow'
+                    : 'text-white/50 hover:text-white',
+                )}
+              >
+                <FileText className="w-3.5 h-3.5" /> Raw OCR Text
+              </button>
+              <button
+                onClick={() => setViewMode('json')}
+                className={cn(
+                  'flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition-colors',
+                  viewMode === 'json'
+                    ? 'bg-brand-600 text-white shadow'
+                    : 'text-white/50 hover:text-white',
+                )}
+              >
+                <Code className="w-3.5 h-3.5" /> JSON
+              </button>
+            </div>
 
-              <div className="flex items-center gap-1 bg-white/[0.04] border border-white/[0.08] rounded-lg p-0.5">
+            {/* Page Navigation & Context Actions */}
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1">
                 <button
-                  onClick={() => setZoomLevel((z) => Math.max(50, z - 25))}
-                  className="p-1 text-white/50 hover:text-white"
-                  title="Zoom Out"
+                  disabled={currentPageNum <= 1}
+                  onClick={() => setCurrentPageNum((p) => Math.max(1, p - 1))}
+                  className="p-1.5 rounded-lg border border-white/[0.08] text-white/60 hover:text-white disabled:opacity-30 transition-colors"
                 >
-                  <ZoomOut className="w-3 h-3" />
+                  <ChevronLeft className="w-3.5 h-3.5" />
                 </button>
-                <span className="text-[10px] font-mono text-white/60 px-1">{zoomLevel}%</span>
+                <span className="text-xs font-semibold text-white/80 px-1">
+                  {currentPageNum} / {totalPages}
+                </span>
                 <button
-                  onClick={() => setZoomLevel((z) => Math.min(150, z + 25))}
-                  className="p-1 text-white/50 hover:text-white"
-                  title="Zoom In"
+                  disabled={currentPageNum >= totalPages}
+                  onClick={() => setCurrentPageNum((p) => Math.min(totalPages, p + 1))}
+                  className="p-1.5 rounded-lg border border-white/[0.08] text-white/60 hover:text-white disabled:opacity-30 transition-colors"
                 >
-                  <ZoomIn className="w-3 h-3" />
+                  <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
+
+              {viewMode === 'visual' && (
+                <>
+                  <button
+                    onClick={() => setShowOcrBoxes(!showOcrBoxes)}
+                    className={cn(
+                      'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors',
+                      showOcrBoxes
+                        ? 'bg-brand-600/20 text-brand-300 border-brand-500/30'
+                        : 'bg-white/[0.04] text-white/50 border-white/[0.06] hover:text-white',
+                    )}
+                  >
+                    {showOcrBoxes ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+                    Overlay
+                  </button>
+
+                  <div className="flex items-center gap-1 bg-white/[0.04] border border-white/[0.08] rounded-lg p-0.5">
+                    <button
+                      onClick={() => setZoomLevel((z) => Math.max(50, z - 25))}
+                      className="p-1 text-white/50 hover:text-white"
+                      title="Zoom Out"
+                    >
+                      <ZoomOut className="w-3 h-3" />
+                    </button>
+                    <span className="text-[10px] font-mono text-white/60 px-1">{zoomLevel}%</span>
+                    <button
+                      onClick={() => setZoomLevel((z) => Math.min(150, z + 25))}
+                      className="p-1 text-white/50 hover:text-white"
+                      title="Zoom In"
+                    >
+                      <ZoomIn className="w-3 h-3" />
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {viewMode === 'text' && (
+                <button
+                  onClick={handleCopyPageText}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-white transition-colors"
+                >
+                  {copiedText ? <CheckCheck className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3 text-brand-400" />}
+                  {copiedText ? 'Copied' : 'Copy Text'}
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Interactive Document Image Container */}
-          <div className="relative overflow-auto max-h-[680px] rounded-xl bg-black/40 border border-white/[0.04] flex items-center justify-center p-4">
-            <div
-              className="relative transition-all duration-200"
-              style={{
-                width: `${zoomLevel}%`,
-                maxWidth: zoomLevel > 100 ? 'none' : '100%',
-              }}
-            >
-              {currentPage?.imageUrl ? (
-                // eslint-disable-next-line
-                <img
-                  src={currentPage.imageUrl}
-                  alt={`Page ${currentPageNum}`}
-                  className="w-full h-auto rounded-lg shadow-2xl pointer-events-none select-none"
-                />
-              ) : (
-                <div className="w-full aspect-[1/1.4] bg-white/[0.02] border border-white/[0.06] rounded-xl flex flex-col items-center justify-center text-white/30 space-y-2">
-                  <FileText className="w-12 h-12 opacity-30" />
-                  <p className="text-xs">Page {currentPageNum} Rendering</p>
-                </div>
-              )}
+          {/* 1. Visual Image Mode */}
+          {viewMode === 'visual' && (
+            <div className="relative overflow-auto max-h-[680px] rounded-xl bg-black/40 border border-white/[0.04] flex items-center justify-center p-4">
+              <div
+                className="relative transition-all duration-200"
+                style={{
+                  width: `${zoomLevel}%`,
+                  maxWidth: zoomLevel > 100 ? 'none' : '100%',
+                }}
+              >
+                {currentPage?.imageUrl ? (
+                  // eslint-disable-next-line
+                  <img
+                    src={currentPage.imageUrl}
+                    alt={`Page ${currentPageNum}`}
+                    className="w-full h-auto rounded-lg shadow-2xl pointer-events-none select-none"
+                  />
+                ) : (
+                  <div className="w-full aspect-[1/1.4] bg-white/[0.02] border border-white/[0.06] rounded-xl flex flex-col items-center justify-center text-white/30 space-y-2">
+                    <FileText className="w-12 h-12 opacity-30" />
+                    <p className="text-xs">Page {currentPageNum} Rendering</p>
+                  </div>
+                )}
 
-              {/* OCR Bounding Boxes Overlay */}
-              {showOcrBoxes && ocrBlocks.length > 0 && (
-                <div className="absolute inset-0 pointer-events-auto">
-                  {ocrBlocks.map((block) => {
-                    const [x1, y1, x2, y2] = block.bbox;
-                    const imgW = pageDetail?.page?.width || 1000;
-                    const imgH = pageDetail?.page?.height || 1400;
+                {/* OCR Bounding Boxes Overlay */}
+                {showOcrBoxes && ocrBlocks.length > 0 && (
+                  <div className="absolute inset-0 pointer-events-auto">
+                    {ocrBlocks.map((block) => {
+                      const [x1, y1, x2, y2] = block.bbox;
+                      const imgW = pageDetail?.page?.width || 1000;
+                      const imgH = pageDetail?.page?.height || 1400;
 
-                    const leftPct = (x1 / imgW) * 100;
-                    const topPct = (y1 / imgH) * 100;
-                    const widthPct = ((x2 - x1) / imgW) * 100;
-                    const heightPct = ((y2 - y1) / imgH) * 100;
+                      const leftPct = (x1 / imgW) * 100;
+                      const topPct = (y1 / imgH) * 100;
+                      const widthPct = ((x2 - x1) / imgW) * 100;
+                      const heightPct = ((y2 - y1) / imgH) * 100;
 
-                    const isHigh = block.confidence >= 0.85;
-                    const isMed = block.confidence >= 0.65 && block.confidence < 0.85;
+                      const isHigh = block.confidence >= 0.85;
+                      const isMed = block.confidence >= 0.65 && block.confidence < 0.85;
 
-                    return (
-                      <div
-                        key={block.id}
-                        style={{
-                          left: `${leftPct}%`,
-                          top: `${topPct}%`,
-                          width: `${Math.max(2, widthPct)}%`,
-                          height: `${Math.max(1.5, heightPct)}%`,
-                        }}
-                        className={cn(
-                          'absolute border transition-all cursor-pointer group rounded-[2px]',
-                          isHigh
-                            ? 'border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/30'
-                            : isMed
-                            ? 'border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/30'
-                            : 'border-red-500/50 bg-red-500/15 hover:bg-red-500/35',
-                        )}
-                      >
-                        {/* Tooltip */}
-                        <div className="absolute left-1/2 -top-8 -translate-x-1/2 hidden group-hover:flex items-center gap-1.5 px-2 py-1 bg-surface-100 border border-white/20 rounded-lg shadow-xl text-[10px] text-white z-30 whitespace-nowrap pointer-events-none">
-                          <span className="font-semibold">{Math.round(block.confidence * 100)}%</span>
-                          <span className="text-white/60 truncate max-w-[160px]">{block.text}</span>
+                      return (
+                        <div
+                          key={block.id}
+                          style={{
+                            left: `${leftPct}%`,
+                            top: `${topPct}%`,
+                            width: `${Math.max(2, widthPct)}%`,
+                            height: `${Math.max(1.5, heightPct)}%`,
+                          }}
+                          className={cn(
+                            'absolute border transition-all cursor-pointer group rounded-[2px]',
+                            isHigh
+                              ? 'border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/30'
+                              : isMed
+                              ? 'border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/30'
+                              : 'border-red-500/50 bg-red-500/15 hover:bg-red-500/35',
+                          )}
+                        >
+                          {/* Tooltip */}
+                          <div className="absolute left-1/2 -top-8 -translate-x-1/2 hidden group-hover:flex items-center gap-1.5 px-2 py-1 bg-surface-100 border border-white/20 rounded-lg shadow-xl text-[10px] text-white z-30 whitespace-nowrap pointer-events-none">
+                            <span className="font-semibold">{Math.round(block.confidence * 100)}%</span>
+                            <span className="text-white/60 truncate max-w-[160px]">{block.text}</span>
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          )}
+
+          {/* 2. Raw OCR Text Mode */}
+          {viewMode === 'text' && (
+            <div className="space-y-3">
+              {/* Search & Metadata Bar */}
+              <div className="flex items-center justify-between gap-3 bg-white/[0.02] border border-white/[0.06] px-3 py-2 rounded-xl">
+                <div className="relative flex-1">
+                  <Search className="w-3.5 h-3.5 text-white/30 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={textSearch}
+                    onChange={(e) => setTextSearch(e.target.value)}
+                    placeholder="Search words in extracted text..."
+                    className="w-full bg-transparent pl-8 pr-3 py-1 text-xs text-white placeholder-white/30 focus:outline-none"
+                  />
+                </div>
+                <div className="flex items-center gap-3 text-[11px] text-white/40 font-mono shrink-0">
+                  <span>{wordCount} words</span>
+                  <span>{charCount} chars</span>
+                  <span>{ocrBlocks.length} blocks</span>
+                </div>
+              </div>
+
+              {/* Text Area */}
+              <div className="relative overflow-auto max-h-[620px] rounded-xl bg-black/40 border border-white/[0.06] p-4 font-mono text-xs text-white/80 leading-relaxed whitespace-pre-wrap select-text">
+                {rawPageText ? (
+                  textSearch.trim() ? (
+                    rawPageText.split(new RegExp(`(${textSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')).map((part, i) =>
+                      part.toLowerCase() === textSearch.toLowerCase() ? (
+                        <mark key={i} className="bg-amber-400/30 text-amber-200 rounded px-0.5">
+                          {part}
+                        </mark>
+                      ) : (
+                        part
+                      ),
+                    )
+                  ) : (
+                    rawPageText
+                  )
+                ) : (
+                  <p className="text-white/30 text-center py-10 font-sans">No text extracted on this page.</p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 3. JSON Schema Mode */}
+          {viewMode === 'json' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between bg-white/[0.02] border border-white/[0.06] px-3 py-2 rounded-xl text-xs text-white/40 font-mono">
+                <span>JSON Structure ({fields.length} fields)</span>
+                <button
+                  onClick={() => {
+                    const exportData = {
+                      documentId: doc.id,
+                      title: doc.title,
+                      category: doc.category,
+                      fields: Object.fromEntries(fields.map((f) => [f.fieldName, f.rawValue])),
+                    };
+                    navigator.clipboard.writeText(JSON.stringify(exportData, null, 2));
+                    toast.success('Copied JSON to clipboard!');
+                  }}
+                  className="text-brand-400 hover:text-brand-300 font-semibold flex items-center gap-1"
+                >
+                  <Copy className="w-3 h-3" /> Copy JSON
+                </button>
+              </div>
+
+              <pre className="relative overflow-auto max-h-[620px] rounded-xl bg-black/50 border border-white/[0.06] p-4 font-mono text-xs text-emerald-300/90 leading-relaxed select-text">
+                {JSON.stringify(
+                  {
+                    documentId: doc.id,
+                    title: doc.title,
+                    category: doc.category,
+                    categoryConfidence: doc.categoryConfidence,
+                    primaryLanguage: doc.primaryLanguage,
+                    createdAt: doc.createdAt,
+                    totalFields: fields.length,
+                    fields: fields.map((f) => ({
+                      fieldName: f.fieldName,
+                      fieldType: f.fieldType,
+                      rawValue: f.rawValue,
+                      normalizedValue: f.normalizedValue,
+                      confidence: f.confidence,
+                      confidenceLevel: f.confidenceLevel,
+                      sourcePage: f.sourcePage,
+                      isVerified: f.isVerified,
+                      isRejected: f.isRejected,
+                    })),
+                  },
+                  null,
+                  2,
+                )}
+              </pre>
+            </div>
+          )}
         </div>
 
         {/* Right Panel: Extracted Fields & HITL Verification */}
@@ -579,6 +752,175 @@ function DocumentMainView({
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Export Dropdown Component ─────────────────────────────────────
+
+function ExportDropdown({
+  doc,
+  fields,
+  activePageText,
+}: {
+  doc: DocumentDetail;
+  fields: DocumentField[];
+  activePageText?: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const downloadFile = (content: string, filename: string, type: string) => {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast.success(`Downloaded ${filename}`);
+    setIsOpen(false);
+  };
+
+  const handleExportJson = () => {
+    const exportData = {
+      documentId: doc.id,
+      title: doc.title,
+      category: doc.category,
+      categoryConfidence: doc.categoryConfidence,
+      primaryLanguage: doc.primaryLanguage,
+      createdAt: doc.createdAt,
+      totalFields: fields.length,
+      fields: fields.map((f) => ({
+        fieldName: f.fieldName,
+        fieldType: f.fieldType,
+        rawValue: f.rawValue,
+        normalizedValue: f.normalizedValue,
+        confidence: f.confidence,
+        confidenceLevel: f.confidenceLevel,
+        sourcePage: f.sourcePage,
+        isVerified: f.isVerified,
+        isRejected: f.isRejected,
+      })),
+    };
+    downloadFile(
+      JSON.stringify(exportData, null, 2),
+      `${doc.title.replace(/\s+/g, '_')}_data.json`,
+      'application/json',
+    );
+  };
+
+  const handleExportCsv = () => {
+    const headers = ['Field Name', 'Field Type', 'Extracted Value', 'Confidence', 'Confidence Level', 'Page', 'Verified'];
+    const rows = fields.map((f) => [
+      `"${f.fieldName}"`,
+      `"${f.fieldType}"`,
+      `"${(f.rawValue ?? '').replace(/"/g, '""')}"`,
+      `"${Math.round(f.confidence * 100)}%"`,
+      `"${f.confidenceLevel}"`,
+      f.sourcePage ?? '',
+      f.isVerified ? 'Yes' : 'No',
+    ]);
+    const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    downloadFile(
+      csvContent,
+      `${doc.title.replace(/\s+/g, '_')}_fields.csv`,
+      'text/csv;charset=utf-8;',
+    );
+  };
+
+  const handleExportTxt = () => {
+    const text = activePageText || fields.map((f) => `${f.fieldName}: ${f.rawValue}`).join('\n');
+    downloadFile(
+      text,
+      `${doc.title.replace(/\s+/g, '_')}_extracted_text.txt`,
+      'text/plain;charset=utf-8;',
+    );
+  };
+
+  const handleCopyJson = () => {
+    const exportData = {
+      title: doc.title,
+      category: doc.category,
+      fields: Object.fromEntries(fields.map((f) => [f.fieldName, f.rawValue])),
+    };
+    navigator.clipboard.writeText(JSON.stringify(exportData, null, 2));
+    setCopied(true);
+    toast.success('Copied JSON to clipboard!');
+    setTimeout(() => setCopied(false), 2000);
+    setIsOpen(false);
+  };
+
+  return (
+    <div className="relative" ref={dropdownRef}>
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-white transition-colors"
+      >
+        <Download className="w-3.5 h-3.5 text-brand-400" /> Export Data
+      </button>
+
+      {isOpen && (
+        <div className="absolute right-0 mt-2 w-56 bg-surface-100 border border-white/10 rounded-2xl shadow-2xl p-1.5 z-50 animate-scale-in">
+          <div className="px-3 py-1.5 text-[10px] font-semibold text-white/40 uppercase tracking-wider">
+            Export Options
+          </div>
+          <button
+            onClick={handleExportJson}
+            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs text-white/80 hover:text-white hover:bg-white/[0.06] transition-colors text-left"
+          >
+            <Code className="w-4 h-4 text-emerald-400" />
+            <div>
+              <p className="font-semibold">Export JSON</p>
+              <p className="text-[10px] text-white/40">Structured fields & metadata</p>
+            </div>
+          </button>
+          <button
+            onClick={handleExportCsv}
+            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs text-white/80 hover:text-white hover:bg-white/[0.06] transition-colors text-left"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-brand-400" />
+            <div>
+              <p className="font-semibold">Export CSV</p>
+              <p className="text-[10px] text-white/40">Spreadsheet table format</p>
+            </div>
+          </button>
+          <button
+            onClick={handleExportTxt}
+            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs text-white/80 hover:text-white hover:bg-white/[0.06] transition-colors text-left"
+          >
+            <FileText className="w-4 h-4 text-blue-400" />
+            <div>
+              <p className="font-semibold">Export Text (.txt)</p>
+              <p className="text-[10px] text-white/40">Full OCR transcript</p>
+            </div>
+          </button>
+          <div className="h-px bg-white/[0.06] my-1" />
+          <button
+            onClick={handleCopyJson}
+            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs text-white/80 hover:text-white hover:bg-white/[0.06] transition-colors text-left"
+          >
+            {copied ? <CheckCheck className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-amber-400" />}
+            <div>
+              <p className="font-semibold">{copied ? 'Copied!' : 'Copy Key-Values JSON'}</p>
+              <p className="text-[10px] text-white/40">Quick clipboard copy</p>
+            </div>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

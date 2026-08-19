@@ -1,9 +1,22 @@
 import type { Metadata } from 'next';
-import { Inter } from 'next/font/google';
+import { Plus_Jakarta_Sans, Playfair_Display } from 'next/font/google';
 import './globals.css';
 import { Providers } from './providers';
 
-const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
+const sans = Plus_Jakarta_Sans({
+  subsets: ['latin'],
+  variable: '--font-sans',
+  weight: ['300', '400', '500', '600', '700', '800'],
+  display: 'swap',
+});
+
+const serif = Playfair_Display({
+  subsets: ['latin'],
+  variable: '--font-serif',
+  style: ['normal', 'italic'],
+  weight: ['400', '600', '700'],
+  display: 'swap',
+});
 
 export const metadata: Metadata = {
   title: { default: 'DocSaarthi — Multilingual Document Intelligence', template: '%s | DocSaarthi' },
@@ -16,10 +29,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className="dark">
       <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="icon" href="/favicon.ico" />
       </head>
-      <body className={`${inter.variable} font-sans bg-surface text-white antialiased`}>
+      <body className={`${sans.variable} ${serif.variable} font-sans bg-[#050508] text-white antialiased selection:bg-brand-500/30 selection:text-white`}>
         <Providers>{children}</Providers>
       </body>
     </html>
