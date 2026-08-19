@@ -120,30 +120,34 @@ export class DocumentsService {
       data: { currentVersionId: version.id, status: DocumentStatus.QUEUED },
     });
 
-    // Enqueue processing job
-    const processingJob = await this.db.processingJob.create({
-      data: {
+    // Enqueue processing job safely
+    try {
+      const processingJob = await this.db.processingJob.create({
+        data: {
+          documentId: document.id,
+          versionId: version.id,
+          queueName: 'document-processing',
+          status: 'QUEUED',
+          currentStage: ProcessingStage.FILE_VALIDATION,
+        },
+      });
+
+      const jobId = await this.queue.enqueueDocumentProcessing({
         documentId: document.id,
         versionId: version.id,
-        queueName: 'document-processing',
-        status: 'QUEUED',
-        currentStage: ProcessingStage.FILE_VALIDATION,
-      },
-    });
+        userId,
+        storageKey,
+        mimeType: file.mimetype,
+        requestId,
+      });
 
-    const jobId = await this.queue.enqueueDocumentProcessing({
-      documentId: document.id,
-      versionId: version.id,
-      userId,
-      storageKey,
-      mimeType: file.mimetype,
-      requestId,
-    });
-
-    await this.db.processingJob.update({
-      where: { id: processingJob.id },
-      data: { bullJobId: jobId },
-    });
+      await this.db.processingJob.update({
+        where: { id: processingJob.id },
+        data: { bullJobId: jobId },
+      });
+    } catch (queueErr) {
+      this.logger.warn(`Could not enqueue to Bull queue immediately: ${String(queueErr)}`);
+    }
 
     await this.audit.log({
       eventType: 'DOCUMENT_UPLOAD_DIRECT',

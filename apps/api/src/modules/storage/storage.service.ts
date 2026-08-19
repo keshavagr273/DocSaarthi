@@ -27,24 +27,37 @@ export class StorageService implements OnModuleInit {
   constructor(private readonly config: ConfigService) {}
 
   onModuleInit(): void {
-    const endpoint = this.config.get<string>('MINIO_ENDPOINT', 'localhost');
-    const port = this.config.get<number>('MINIO_PORT', 9000);
-    const useSSL = this.config.get<boolean>('MINIO_USE_SSL', false);
+    let endpoint = (this.config.get<string>('MINIO_ENDPOINT', 'localhost') || 'localhost').trim();
+    // Strip leading https:// or http:// if user included it in environment variable
+    endpoint = endpoint.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+
+    const rawPort = this.config.get<string | number>('MINIO_PORT', 9000);
+    const port = typeof rawPort === 'string' ? parseInt(rawPort, 10) : rawPort;
+
+    const rawUseSSL = this.config.get<string | boolean>('MINIO_USE_SSL', false);
+    const isCloudflare = endpoint.includes('r2.cloudflarestorage.com');
+    const useSSL =
+      rawUseSSL === true ||
+      rawUseSSL === 'true' ||
+      rawUseSSL === '1' ||
+      port === 443 ||
+      isCloudflare;
+
     const accessKey = this.config.getOrThrow<string>('MINIO_ACCESS_KEY');
     const secretKey = this.config.getOrThrow<string>('MINIO_SECRET_KEY');
     this.bucket = this.config.get<string>('MINIO_BUCKET', 'docsaarthi');
 
     const protocol = useSSL ? 'https' : 'http';
     const endpointUrl =
-      port === 443 || port === 80 || !port
+      port === 443 || port === 80 || isCloudflare || !port
         ? `${protocol}://${endpoint}`
         : `${protocol}://${endpoint}:${port}`;
 
     this.client = new S3Client({
       endpoint: endpointUrl,
-      region: 'auto', // R2 requires region: 'auto' or us-east-1
+      region: isCloudflare ? 'auto' : 'us-east-1',
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
-      forcePathStyle: true, // Compatible with R2 and MinIO
+      forcePathStyle: !isCloudflare, // R2 prefers virtual-hosted style or forcePathStyle depending on endpoint
     });
 
     this.logger.log(`Storage connected → ${endpointUrl}/${this.bucket}`);

@@ -21,24 +21,33 @@ export class StorageClientService implements OnModuleInit {
   private bucket!: string;
 
   onModuleInit(): void {
-    const endpoint = process.env['MINIO_ENDPOINT'] ?? 'localhost';
-    const port = parseInt(process.env['MINIO_PORT'] ?? '9000', 10);
-    const useSSL = process.env['MINIO_USE_SSL'] === 'true';
+    let endpoint = (process.env['MINIO_ENDPOINT'] ?? 'localhost').trim();
+    endpoint = endpoint.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+
+    const rawPort = process.env['MINIO_PORT'] ?? '9000';
+    const port = parseInt(rawPort, 10);
+    const isCloudflare = endpoint.includes('r2.cloudflarestorage.com');
+    const useSSL =
+      process.env['MINIO_USE_SSL'] === 'true' ||
+      process.env['MINIO_USE_SSL'] === '1' ||
+      port === 443 ||
+      isCloudflare;
+
     const accessKey = process.env['MINIO_ACCESS_KEY'] ?? 'docsaarthi_minio';
     const secretKey = process.env['MINIO_SECRET_KEY'] ?? 'docsaarthi_minio_secret';
     this.bucket = process.env['MINIO_BUCKET'] ?? 'docsaarthi';
 
     const protocol = useSSL ? 'https' : 'http';
     const endpointUrl =
-      port === 443 || port === 80 || !port
+      port === 443 || port === 80 || isCloudflare || !port
         ? `${protocol}://${endpoint}`
         : `${protocol}://${endpoint}:${port}`;
 
     this.client = new S3Client({
       endpoint: endpointUrl,
-      region: 'auto',
+      region: isCloudflare ? 'auto' : 'us-east-1',
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
-      forcePathStyle: true,
+      forcePathStyle: !isCloudflare,
     });
 
     this.logger.log(`Worker storage → ${endpointUrl}/${this.bucket}`);
