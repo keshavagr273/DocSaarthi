@@ -35,9 +35,10 @@ export class LlmService {
   constructor() {
     this.client = new OpenAI({
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
+      baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'gpt-4o-mini';
-    this.visionModel = process.env['DEFAULT_VISION_MODEL'] ?? 'gpt-4o-mini';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b';
+    this.visionModel = process.env['DEFAULT_VISION_MODEL'] ?? 'openai/gpt-oss-20b';
     this.embeddingModel = process.env['DEFAULT_EMBEDDING_MODEL'] ?? 'text-embedding-3-small';
   }
 

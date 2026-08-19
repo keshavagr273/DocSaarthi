@@ -60,8 +60,8 @@ export class HealthController {
         return {
           llmProvider: {
             status: hasKey ? ('up' as const) : ('down' as const),
-            provider: 'openai',
-            model: process.env['DEFAULT_LLM_MODEL'] ?? 'gpt-4o-mini',
+            provider: process.env['DEFAULT_LLM_PROVIDER'] ?? 'openai',
+            model: process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b',
           },
         };
       },

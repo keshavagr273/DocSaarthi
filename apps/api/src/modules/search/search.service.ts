@@ -33,6 +33,7 @@ export class SearchService {
   constructor(private readonly db: DatabaseService) {
     this.openai = new OpenAI({
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
+      baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
     this.embeddingModel = process.env['DEFAULT_EMBEDDING_MODEL'] ?? 'text-embedding-3-small';
   }

@@ -8,7 +8,10 @@ const nextConfig: NextConfig = {
   images: {
     remotePatterns: [
       { protocol: 'http', hostname: 'localhost', port: '9000' },
-      { protocol: 'https', hostname: '*.docsaarthi.com' },
+      { protocol: 'http', hostname: '127.0.0.1', port: '9000' },
+      { protocol: 'https', hostname: '**.supabase.co' },
+      { protocol: 'https', hostname: '**.docsaarthi.com' },
+      { protocol: 'https', hostname: '**.amazonaws.com' },
     ],
   },
 };

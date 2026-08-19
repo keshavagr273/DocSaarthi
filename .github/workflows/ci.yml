@@ -27,7 +27,7 @@ jobs:
         run: npx prisma generate --schema=./packages/database/prisma/schema.prisma
 
       - name: Typecheck Workspaces
-        run: npm run type-check --workspaces
+        run: npm run type-check --workspaces --if-present
 
   build:
     name: Build Packages & Apps

@@ -7,6 +7,7 @@ export const envSchema = z.object({
 
   // Database
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+  DIRECT_URL: z.string().optional(),
 
   // Redis
   REDIS_URL: z.string().default('redis://localhost:6379'),
@@ -36,8 +37,10 @@ export const envSchema = z.object({
 
   // AI
   OPENAI_API_KEY: z.string().optional(),
+  OPENAI_BASE_URL: z.string().optional(),
   DEFAULT_LLM_PROVIDER: z.string().default('openai'),
-  DEFAULT_LLM_MODEL: z.string().default('gpt-4o-mini'),
+  DEFAULT_LLM_MODEL: z.string().default('openai/gpt-oss-20b'),
+  DEFAULT_VISION_MODEL: z.string().default('openai/gpt-oss-20b'),
   DEFAULT_EMBEDDING_MODEL: z.string().default('text-embedding-3-small'),
   EMBEDDING_DIMENSION: z.coerce.number().default(1536),
 

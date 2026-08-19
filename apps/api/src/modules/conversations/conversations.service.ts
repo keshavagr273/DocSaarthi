@@ -26,8 +26,9 @@ export class ConversationsService {
   ) {
     this.openai = new OpenAI({
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
+      baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'gpt-4o-mini';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b';
   }
 
   // ── Conversation Management ───────────────────────────────────────
