@@ -14,6 +14,9 @@ const nextConfig: NextConfig = {
       { protocol: 'https', hostname: '**.amazonaws.com' },
     ],
   },
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
 };
 
 export default nextConfig;

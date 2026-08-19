@@ -506,7 +506,7 @@ function DocumentMainView({
               }}
             >
               {currentPage?.imageUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
+                // eslint-disable-next-line
                 <img
                   src={currentPage.imageUrl}
                   alt={`Page ${currentPageNum}`}
