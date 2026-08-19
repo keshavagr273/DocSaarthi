@@ -16,8 +16,8 @@ export const envSchema = z.object({
   // Storage
   MINIO_ENDPOINT: z.string().default('localhost'),
   MINIO_PORT: z.coerce.number().default(9000),
-  MINIO_ACCESS_KEY: z.string().min(1, 'MINIO_ACCESS_KEY is required'),
-  MINIO_SECRET_KEY: z.string().min(1, 'MINIO_SECRET_KEY is required'),
+  MINIO_ACCESS_KEY: z.string().default('docsaarthi_minio'),
+  MINIO_SECRET_KEY: z.string().default('docsaarthi_minio_secret'),
   MINIO_BUCKET: z.string().default('docsaarthi'),
   MINIO_USE_SSL: z.string().transform((v) => v === 'true').default('false'),
   MINIO_PRESIGN_EXPIRY_SECONDS: z.coerce.number().default(3600),
