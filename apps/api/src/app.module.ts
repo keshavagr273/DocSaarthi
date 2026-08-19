@@ -10,6 +10,8 @@ import { QueueModule } from './modules/queue/queue.module';
 import { HealthModule } from './modules/health/health.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { ReviewModule } from './modules/review/review.module';
+import { SearchModule } from './modules/search/search.module';
+import { ConversationsModule } from './modules/conversations/conversations.module';
 import { envSchema } from './config/env.schema';
 
 @Module({
@@ -53,6 +55,8 @@ import { envSchema } from './config/env.schema';
     UsersModule,
     DocumentsModule,
     ReviewModule,
+    SearchModule,
+    ConversationsModule,
     HealthModule,
   ],
 })

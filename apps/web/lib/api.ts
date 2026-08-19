@@ -167,6 +167,52 @@ export const reviewApi = {
     api.post<{ data: DocumentField }>(`/review/fields/${fieldId}/reject`, data ?? {}),
 };
 
+export const searchApi = {
+  search: (params: {
+    q: string;
+    mode?: 'hybrid' | 'semantic' | 'keyword';
+    category?: string;
+    lang?: string;
+    documentId?: string;
+    uploadedAfter?: string;
+    uploadedBefore?: string;
+    page?: number;
+    limit?: number;
+  }) => api.get<{ data: SearchResponse }>('/search', { params }),
+
+  semantic: (data: { query: string; documentId?: string; category?: string; limit?: number }) =>
+    api.post<{ data: { query: string; mode: string; results: SearchResultItem[]; totalResults: number } }>(
+      '/search/semantic',
+      data,
+    ),
+
+  keyword: (data: { query: string; documentId?: string; category?: string; limit?: number }) =>
+    api.post<{ data: { query: string; mode: string; results: SearchResultItem[]; totalResults: number } }>(
+      '/search/keyword',
+      data,
+    ),
+};
+
+export const conversationsApi = {
+  create: (data: { documentId?: string; title?: string; language?: string }) =>
+    api.post<{ data: ConversationSummary }>('/conversations', data),
+
+  list: () =>
+    api.get<{ data: ConversationSummary[] }>('/conversations'),
+
+  get: (conversationId: string) =>
+    api.get<{ data: ConversationDetail }>(`/conversations/${conversationId}`),
+
+  delete: (conversationId: string) =>
+    api.delete(`/conversations/${conversationId}`),
+
+  sendMessageSync: (conversationId: string, data: { content: string }) =>
+    api.post<{ data: { userMessage: MessageItem; assistantMessage: MessageItem } }>(
+      `/conversations/${conversationId}/messages`,
+      { ...data, stream: false },
+    ),
+};
+
 // ── Types ─────────────────────────────────────────────────────
 
 export interface User {
@@ -345,4 +391,84 @@ export interface VersionCompareResponse {
   v2: { id: string; versionNumber: number; createdAt: string };
   summary: string;
   fieldDiffs: FieldDiffItem[];
+}
+
+export interface SearchResultItem {
+  chunkId: string;
+  documentId: string;
+  documentTitle: string;
+  documentCategory: string | null;
+  pageNumber: number;
+  sectionTitle: string | null;
+  snippet: string;
+  semanticScore: number;
+  keywordScore: number;
+  finalScore: number;
+}
+
+export interface SearchResponse {
+  query: string;
+  mode: 'hybrid' | 'semantic' | 'keyword';
+  results: SearchResultItem[];
+  totalResults: number;
+  searchDurationMs: number;
+}
+
+export interface CitationItem {
+  id?: string;
+  chunkId: string;
+  documentId: string;
+  documentTitle?: string;
+  pageNumber: number;
+  sectionTitle?: string | null;
+  relevanceScore?: number | null;
+  chunk?: {
+    content: string;
+    pageNumber: number;
+    sectionTitle: string | null;
+  };
+}
+
+export interface MessageItem {
+  id: string;
+  role: 'USER' | 'ASSISTANT' | 'SYSTEM';
+  content: string;
+  language?: string | null;
+  createdAt: string;
+  citations?: CitationItem[];
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string | null;
+  language: string | null;
+  documentId: string | null;
+  document?: {
+    id: string;
+    title: string;
+    category: string | null;
+  } | null;
+  lastMessage: {
+    content: string;
+    role: string;
+    createdAt: string;
+  } | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationDetail {
+  id: string;
+  title: string | null;
+  language: string | null;
+  documentId: string | null;
+  document?: {
+    id: string;
+    title: string;
+    category: string | null;
+    primaryLanguage: string | null;
+  } | null;
+  messages: MessageItem[];
+  createdAt: string;
+  updatedAt: string;
 }

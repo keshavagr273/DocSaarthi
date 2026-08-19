@@ -31,6 +31,7 @@ import {
   Plus,
   UploadCloud,
   Sparkles,
+  MessageSquare,
 } from 'lucide-react';
 import {
   documentsApi,
@@ -279,6 +280,14 @@ export default function DocumentDetailPage({
               {activeTab === 'compare' ? 'View Document' : 'Compare Versions'}
             </button>
           )}
+
+          {/* Chat with Document */}
+          <Link
+            href={`/documents/${documentId}/chat`}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-white transition-colors"
+          >
+            <MessageSquare className="w-3.5 h-3.5 text-brand-400" /> Chat
+          </Link>
 
           {/* Upload New Version */}
           <button
