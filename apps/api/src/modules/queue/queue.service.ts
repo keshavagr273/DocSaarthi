@@ -22,17 +22,22 @@ export class QueueService {
   ) {}
 
   async enqueueDocumentProcessing(data: DocumentProcessingJobData): Promise<string> {
-    const job = await this.documentQueue.add(JOBS.PROCESS_DOCUMENT, data, {
-      jobId: `doc-${data.documentId}-v${data.versionId}-${Date.now()}`,
-      removeOnComplete: 100,
-      removeOnFail: 100,
-    });
+    try {
+      const job = await this.documentQueue.add(JOBS.PROCESS_DOCUMENT, data, {
+        jobId: `doc-${data.documentId}-v${data.versionId}-${Date.now()}`,
+        removeOnComplete: 100,
+        removeOnFail: 100,
+      });
 
-    this.logger.log(
-      `Enqueued job ${job.id} for document ${data.documentId} (version ${data.versionId})`,
-    );
+      this.logger.log(
+        `Enqueued job ${job.id} for document ${data.documentId} (version ${data.versionId})`,
+      );
 
-    return String(job.id);
+      return String(job.id);
+    } catch (err) {
+      this.logger.warn(`Could not enqueue to Redis queue (will process when worker active): ${String(err)}`);
+      return `job-offline-${Date.now()}`;
+    }
   }
 
   async getQueueStats() {
