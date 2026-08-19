@@ -64,7 +64,7 @@ export class ValidationStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 11: VALIDATION`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 72);
 
     const dbFields = await this.db.documentField.findMany({
@@ -73,6 +73,7 @@ export class ValidationStage extends BaseStage {
 
     const parsedDates: Record<string, Date | null> = {};
     const parsedCurrencies: Record<string, number | null> = {};
+    const updatePromises: Promise<unknown>[] = [];
 
     for (const field of dbFields) {
       let newConfidence = field.confidence;
@@ -125,22 +126,56 @@ export class ValidationStage extends BaseStage {
       const clampedConfidence = Math.min(1.0, Math.max(0.0, newConfidence));
       const confidenceLevel = this.toLevel(clampedConfidence);
 
-      await this.db.documentField.update({
-        where: { id: field.id },
-        data: {
-          normalizedValue: normalizedValue !== null ? (normalizedValue as never) : undefined,
-          confidence: clampedConfidence,
-          confidenceLevel: confidenceLevel as never,
-        },
-      });
+      updatePromises.push(
+        this.db.documentField.update({
+          where: { id: field.id },
+          data: {
+            normalizedValue: normalizedValue !== null ? (normalizedValue as never) : undefined,
+            confidence: clampedConfidence,
+            confidenceLevel: confidenceLevel as never,
+          },
+        }),
+      );
+    }
+
+    if (updatePromises.length > 0) {
+      await Promise.all(updatePromises);
     }
 
     // ── 4. Cross-Field Validations ──────────────────────────────────
     await this.crossValidateDates(ctx.documentId, parsedDates);
     await this.crossValidateInvoiceMath(ctx.documentId, parsedCurrencies);
 
-    await this.markStageCompleted(ctx.versionId);
-    this.logger.log(`[${ctx.documentId}] Stage 11 DONE — validated ${dbFields.length} fields`);
+    this.markStageCompleted(ctx.versionId, ctx);
+    this.logger.log(
+      `[${ctx.documentId}] Stage 11 DONE — validated ${dbFields.length} fields | ` +
+      `dates=${Object.keys(parsedDates).length} | currencies=${Object.keys(parsedCurrencies).length}`,
+    );
+
+    const validationLines: string[] = [];
+    for (const field of dbFields) {
+      if (field.fieldType === 'DATE') {
+        const parsed = parsedDates[field.fieldName];
+        validationLines.push(
+          `  [DATE]     ${field.fieldName}: "${field.rawValue}" → ${parsed ? parsed.toISOString().split('T')[0] : 'PARSE_FAILED'}`,
+        );
+      } else if (field.fieldType === 'CURRENCY') {
+        const parsed = parsedCurrencies[field.fieldName];
+        validationLines.push(
+          `  [CURRENCY] ${field.fieldName}: "${field.rawValue}" → ${parsed !== null && parsed !== undefined ? parsed : 'PARSE_FAILED'}`,
+        );
+      } else if (field.fieldType === 'ID_NUMBER') {
+        const isGstin = this.looksLikeGstin(field.rawValue);
+        validationLines.push(
+          `  [ID]       ${field.fieldName}: "${field.rawValue}" → gstin=${isGstin ? (this.isValidGstin(field.rawValue) ? 'VALID' : 'INVALID') : 'n/a'}`,
+        );
+      }
+    }
+    if (validationLines.length > 0) {
+      this.logger.debug(
+        `[${ctx.documentId}] Stage 11 VALIDATION DETAILS:\n` + validationLines.join('\n'),
+      );
+    }
   }
 
   // ── Date parsing ─────────────────────────────────────────────────

@@ -9,7 +9,7 @@ import { Logger } from '@nestjs/common';
 import { Job } from 'bull';
 import { DatabaseService, ProcessingStatus, ProcessingStage, DocumentStatus } from '@docsaarthi/database';
 import { QUEUES, JOBS } from '@docsaarthi/shared';
-import { createPipelineContext } from '../stages/pipeline-context';
+import { createPipelineContext, type PipelineContext, type OcrBlock } from '../stages/pipeline-context';
 
 // ── Stage imports ───────────────────────────────────────────────────
 import { FileValidationStage } from '../stages/file-validation.stage';
@@ -95,7 +95,20 @@ export class DocumentProcessor {
   // ── Main processor ───────────────────────────────────────────────
 
   @Process(JOBS.PROCESS_DOCUMENT)
-  async handleDocumentProcessing(
+  async handleDocumentProcessingNamed(
+    job: Job<DocumentProcessingJobData>,
+  ): Promise<{ success: boolean; documentId: string }> {
+    return this.processDocumentJob(job);
+  }
+
+  @Process()
+  async handleDocumentProcessingDefault(
+    job: Job<DocumentProcessingJobData>,
+  ): Promise<{ success: boolean; documentId: string }> {
+    return this.processDocumentJob(job);
+  }
+
+  private async processDocumentJob(
     job: Job<DocumentProcessingJobData>,
   ): Promise<{ success: boolean; documentId: string }> {
     const { documentId, versionId } = job.data;
@@ -142,6 +155,8 @@ export class DocumentProcessor {
         this.indexingStage,
       ];
 
+      const stageTimes: Array<{ name: string; durationMs: number }> = [];
+      const pipelineStart = Date.now();
       const totalStages = pipeline.length;
 
       // ── Execute each stage ──────────────────────────────────────
@@ -154,10 +169,28 @@ export class DocumentProcessor {
           this.logger.debug(
             `[${documentId}] Skipping already-completed stage ${i + 1}/${totalStages}`,
           );
+
+          // ── Context rehydration from DB ─────────────────────────
+          // When a stage is skipped, its in-memory results are missing.
+          // We must reload persisted data so downstream stages have context.
+          await this.rehydrateContextForSkippedStage(ctx, stage, pipeline);
+
           continue;
         }
 
+        const stageLabel = (stage as unknown as { stageName?: string }).stageName ?? stage.constructor.name;
+        this.logger.log(`\n${'─'.repeat(60)}\n▶ [${i + 1}/${totalStages}] ${stageLabel} — STARTING\n${'─'.repeat(60)}`);
+
+        const t0 = Date.now();
         await stage.execute(ctx, job);
+        const durationMs = Date.now() - t0;
+
+        stageTimes.push({ name: stageLabel, durationMs });
+
+        // ASCII bar: each █ = 500ms, max 20 blocks
+        const bars = Math.min(20, Math.round(durationMs / 500));
+        const bar = bars > 0 ? '█'.repeat(bars) : '▏';
+        this.logger.log(`✅ [${i + 1}/${totalStages}] ${stageLabel} — ${durationMs}ms  ${bar}`);
       }
 
       // ── Mark as COMPLETED ───────────────────────────────────────
@@ -196,6 +229,29 @@ export class DocumentProcessor {
 
       await job.progress(100);
 
+      // ── Pipeline Summary Table ──────────────────────────────────
+      const totalPipelineMs = Date.now() - pipelineStart;
+      const maxDur = Math.max(...stageTimes.map((s) => s.durationMs), 1);
+      const nameColWidth = Math.max(...stageTimes.map((s) => s.name.length), 20);
+      const divider = '─'.repeat(nameColWidth + 32);
+
+      this.logger.log(`\n${'═'.repeat(nameColWidth + 32)}`);
+      this.logger.log(`  📊 PIPELINE SUMMARY — document=${documentId}`);
+      this.logger.log(`${'═'.repeat(nameColWidth + 32)}`);
+      this.logger.log(`  ${'STAGE'.padEnd(nameColWidth)}  ${'TIME (ms)'.padStart(9)}  BAR`);
+      this.logger.log(`  ${divider}`);
+
+      for (const { name, durationMs: dur } of stageTimes) {
+        const bars = Math.max(1, Math.round((dur / maxDur) * 20));
+        const bar = '█'.repeat(bars);
+        const warning = dur > 5000 ? ' ⚠️  SLOW' : dur > 2000 ? ' 🐢' : '';
+        this.logger.log(`  ${name.padEnd(nameColWidth)}  ${String(dur).padStart(9)}ms  ${bar}${warning}`);
+      }
+
+      this.logger.log(`  ${divider}`);
+      this.logger.log(`  ${'TOTAL'.padEnd(nameColWidth)}  ${String(totalPipelineMs).padStart(9)}ms`);
+      this.logger.log(`${'═'.repeat(nameColWidth + 32)}\n`);
+
       this.logger.log(
         `✅ Document processing COMPLETE: document=${documentId} duration=${durationMs}ms`,
       );
@@ -208,6 +264,113 @@ export class DocumentProcessor {
         error.stack,
       );
       throw error; // BullMQ will handle retry
+    }
+  }
+
+  // ── Context rehydration from DB ─────────────────────────────────
+
+  /**
+   * When a stage is already completed and skipped on retry, reload its persisted
+   * results back into ctx so that downstream stages have the data they need.
+   */
+  private async rehydrateContextForSkippedStage(
+    ctx: PipelineContext,
+    stage: BaseStage,
+    pipeline: BaseStage[],
+  ): Promise<void> {
+    const { documentId, versionId } = ctx;
+
+    // Determine which stage this is by index
+    const stageIdx = pipeline.indexOf(stage);
+
+    // Stage 2 (index 1): FILE_STORAGE — thumbnail key stored in documentVersion
+    if (stageIdx === 1 && !ctx.thumbnailStorageKey) {
+      const version = await this.db.documentVersion.findUnique({
+        where: { id: versionId },
+        select: { thumbnailStorageKey: true },
+      });
+      if (version?.thumbnailStorageKey) {
+        ctx.thumbnailStorageKey = version.thumbnailStorageKey;
+      }
+    }
+
+    // Stage 2 (index 2): PDF_RENDERING — pageIds from documentPages
+    if (stageIdx === 2 && !ctx.pageIds) {
+      const pages = await this.db.documentPage.findMany({
+        where: { versionId },
+        select: { id: true, pageNumber: true, storageKey: true },
+        orderBy: { pageNumber: 'asc' },
+      });
+      ctx.pageIds = {};
+      ctx.pageStorageKeys = {};
+      for (const p of pages) {
+        ctx.pageIds[p.pageNumber] = p.id;
+        ctx.pageStorageKeys[p.pageNumber] = p.storageKey;
+      }
+      this.logger.debug(`[${documentId}] Rehydrated ${pages.length} page IDs from DB`);
+    }
+
+    // Stage 4 (index 4): OCR — ocrResults from ocrResult table
+    if (stageIdx === 4 && !ctx.ocrResults) {
+      const ocrRows = await this.db.ocrResult.findMany({
+        where: { versionId },
+        orderBy: { pageNumber: 'asc' },
+      });
+      ctx.ocrResults = ocrRows.map((row) => ({
+        pageNumber: row.pageNumber,
+        width: 0,
+        height: 0,
+        blocks: Array.isArray(row.blocks) ? (row.blocks as unknown as OcrBlock[]) : [],
+        rawText: row.rawText ?? '',
+        pageConfidence: row.pageConfidence ?? 0,
+        pageLanguage: row.pageLanguage ?? 'en',
+        processingTimeMs: row.processingTimeMs ?? 0,
+        fallbackUsed: row.fallbackUsed ?? false,
+      }));
+      this.logger.debug(
+        `[${documentId}] Rehydrated ${ctx.ocrResults.length} OCR pages from DB`,
+      );
+    }
+
+    // Stage 5 (index 5): LANGUAGE_DETECTION — derive from already-rehydrated ocrResults
+    if (stageIdx === 5 && !ctx.primaryLanguage) {
+      // Language is stored in ocrResult rows; derive from most common pageLanguage
+      if (ctx.ocrResults && ctx.ocrResults.length > 0) {
+        ctx.primaryLanguage = ctx.ocrResults[0]?.pageLanguage ?? 'en';
+      } else {
+        ctx.primaryLanguage = 'en';
+      }
+    }
+
+    // Stage 11 (index 11): CHUNKING — chunkIds + full chunks from documentChunks
+    if (stageIdx === 11 && !ctx.chunkIds) {
+      const chunkRows = await this.db.documentChunk.findMany({
+        where: { versionId },
+        select: {
+          id: true,
+          chunkIndex: true,
+          content: true,
+          pageNumber: true,
+          sectionTitle: true,
+          tokenCount: true,
+          charCount: true,
+          language: true,
+        },
+        orderBy: { chunkIndex: 'asc' },
+      });
+      ctx.chunkIds = chunkRows.map((c) => c.id);
+      ctx.chunks = chunkRows.map((c) => ({
+        chunkIndex: c.chunkIndex,
+        content: c.content,
+        pageNumber: c.pageNumber,
+        sectionTitle: c.sectionTitle ?? undefined,
+        tokenCount: c.tokenCount,
+        charCount: c.charCount,
+        language: c.language ?? undefined,
+      }));
+      this.logger.debug(
+        `[${documentId}] Rehydrated ${ctx.chunkIds.length} chunks (with content) from DB`,
+      );
     }
   }
 

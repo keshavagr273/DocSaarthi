@@ -31,7 +31,7 @@ export class StructuredExtractionStage extends BaseStage {
     this.logger.log(
       `[${ctx.documentId}] Stage 9: STRUCTURED_EXTRACTION (category=${ctx.category})`,
     );
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 60);
 
     const text = ctx.normalizedText ?? '';
@@ -45,48 +45,75 @@ export class StructuredExtractionStage extends BaseStage {
     await this.db.documentVersionField.deleteMany({ where: { versionId: ctx.versionId } });
 
     const createdFields: ExtractedField[] = [];
+    // Use explicit Prisma input types — Parameters<createMany>[0] is optional so .data would be unsafe
+    const fieldCreateData: {
+      documentId: string; fieldName: string; fieldType: never; rawValue: string;
+      confidence: number; confidenceLevel: 'HIGH' | 'MEDIUM' | 'LOW'; sourcePage: number | null;
+      extractionMethod: string; isVerified: boolean; isRejected: boolean;
+    }[] = [];
+    const versionFieldCreateData: {
+      versionId: string; fieldName: string; fieldType: never; rawValue: string;
+      confidence: number; sourcePage: number | null; extractionMethod: string;
+    }[] = [];
 
     for (const field of fields) {
       if (!field.rawValue.trim()) continue; // skip empty extractions
 
-      // Create document_fields record
-      await this.db.documentField.create({
-        data: {
-          documentId: ctx.documentId,
-          fieldName: field.fieldName,
-          fieldType: field.fieldType as never,
-          rawValue: field.rawValue,
-          confidence: field.confidence,
-          confidenceLevel: this.toConfidenceLevel(field.confidence),
-          sourcePage: field.sourcePage ?? null,
-          extractionMethod: 'llm',
-          isVerified: false,
-          isRejected: false,
-        },
+      fieldCreateData.push({
+        documentId: ctx.documentId,
+        fieldName: field.fieldName,
+        fieldType: field.fieldType as never,
+        rawValue: field.rawValue,
+        confidence: field.confidence,
+        confidenceLevel: this.toConfidenceLevel(field.confidence),
+        sourcePage: field.sourcePage ?? null,
+        extractionMethod: 'llm',
+        isVerified: false,
+        isRejected: false,
       });
 
-      // Create document_version_fields record
-      await this.db.documentVersionField.create({
-        data: {
-          versionId: ctx.versionId,
-          fieldName: field.fieldName,
-          fieldType: field.fieldType as never,
-          rawValue: field.rawValue,
-          confidence: field.confidence,
-          sourcePage: field.sourcePage ?? null,
-          extractionMethod: 'llm',
-        },
+      versionFieldCreateData.push({
+        versionId: ctx.versionId,
+        fieldName: field.fieldName,
+        fieldType: field.fieldType as never,
+        rawValue: field.rawValue,
+        confidence: field.confidence,
+        sourcePage: field.sourcePage ?? null,
+        extractionMethod: 'llm',
       });
 
       createdFields.push(field);
     }
 
+    // Bulk insert — replaces N sequential create() round-trips with 2 queries
+    if (fieldCreateData.length > 0) {
+      await this.db.documentField.createMany({ data: fieldCreateData });
+      await this.db.documentVersionField.createMany({ data: versionFieldCreateData });
+    }
+
     ctx.extractedFields = createdFields;
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
     this.logger.log(
-      `[${ctx.documentId}] Stage 9 DONE — extracted ${createdFields.length} fields`,
+      `[${ctx.documentId}] Stage 9 DONE — extracted ${createdFields.length} fields | ` +
+      `category=${ctx.category} | lang=${ctx.primaryLanguage}`,
     );
+
+    if (createdFields.length > 0) {
+      const colW = Math.max(...createdFields.map((f) => f.fieldName.length), 12);
+      const fieldLines = createdFields.map((f) =>
+        `  ${f.fieldName.padEnd(colW)}  [${f.fieldType.padEnd(10)}]  ` +
+        `${(f.confidence * 100).toFixed(0)}%  "${String(f.rawValue).substring(0, 60)}"`
+      );
+      this.logger.log(
+        `[${ctx.documentId}] Stage 9 EXTRACTED FIELDS:\n` +
+        `  ${'FIELD'.padEnd(colW)}  TYPE            CONF  VALUE\n` +
+        `  ${'\u2500'.repeat(colW + 40)}\n` +
+        fieldLines.join('\n'),
+      );
+    } else {
+      this.logger.warn(`[${ctx.documentId}] Stage 9: No fields extracted — check LLM prompt/schema for category=${ctx.category}`);
+    }
   }
 
   private toConfidenceLevel(confidence: number): 'HIGH' | 'MEDIUM' | 'LOW' {

@@ -79,7 +79,7 @@ export class SearchService {
     const vectorString = `[${Array.from(embedding).join(',')}]`;
 
     // Dynamic filter clauses
-    let docFilter = Prisma.sql`AND d.user_id = ${userId} AND d.is_deleted = false`;
+    let docFilter = Prisma.sql`AND d."userId" = ${userId} AND d."isDeleted" = false`;
     if (filters.documentId) {
       docFilter = Prisma.sql`${docFilter} AND d.id = ${filters.documentId}`;
     }
@@ -87,13 +87,13 @@ export class SearchService {
       docFilter = Prisma.sql`${docFilter} AND d.category = ${filters.category}::"DocumentCategory"`;
     }
     if (filters.lang) {
-      docFilter = Prisma.sql`${docFilter} AND d.primary_language = ${filters.lang}`;
+      docFilter = Prisma.sql`${docFilter} AND d."primaryLanguage" = ${filters.lang}`;
     }
     if (filters.uploadedAfter) {
-      docFilter = Prisma.sql`${docFilter} AND d.created_at >= ${new Date(filters.uploadedAfter)}`;
+      docFilter = Prisma.sql`${docFilter} AND d."createdAt" >= ${new Date(filters.uploadedAfter)}`;
     }
     if (filters.uploadedBefore) {
-      docFilter = Prisma.sql`${docFilter} AND d.created_at <= ${new Date(filters.uploadedBefore)}`;
+      docFilter = Prisma.sql`${docFilter} AND d."createdAt" <= ${new Date(filters.uploadedBefore)}`;
     }
 
     try {
@@ -114,13 +114,13 @@ export class SearchService {
           d.id AS document_id,
           d.title AS document_title,
           d.category::text AS document_category,
-          dc.page_number,
-          dc.section_title,
+          dc."pageNumber" AS page_number,
+          dc."sectionTitle" AS section_title,
           dc.content,
           GREATEST(0, (1 - (de.embedding <=> ${vectorString}::vector))) AS semantic_score
         FROM document_embeddings de
-        JOIN document_chunks dc ON de.chunk_id = dc.id
-        JOIN documents d ON dc.document_id = d.id
+        JOIN document_chunks dc ON de."chunkId" = dc.id
+        JOIN documents d ON dc."documentId" = d.id
         WHERE 1=1 ${docFilter}
         ORDER BY de.embedding <=> ${vectorString}::vector ASC
         LIMIT ${limit};
@@ -155,7 +155,7 @@ export class SearchService {
     const cleanQuery = query.trim();
     if (!cleanQuery) return [];
 
-    let docFilter = Prisma.sql`AND d.user_id = ${userId} AND d.is_deleted = false`;
+    let docFilter = Prisma.sql`AND d."userId" = ${userId} AND d."isDeleted" = false`;
     if (filters.documentId) {
       docFilter = Prisma.sql`${docFilter} AND d.id = ${filters.documentId}`;
     }
@@ -163,13 +163,13 @@ export class SearchService {
       docFilter = Prisma.sql`${docFilter} AND d.category = ${filters.category}::"DocumentCategory"`;
     }
     if (filters.lang) {
-      docFilter = Prisma.sql`${docFilter} AND d.primary_language = ${filters.lang}`;
+      docFilter = Prisma.sql`${docFilter} AND d."primaryLanguage" = ${filters.lang}`;
     }
     if (filters.uploadedAfter) {
-      docFilter = Prisma.sql`${docFilter} AND d.created_at >= ${new Date(filters.uploadedAfter)}`;
+      docFilter = Prisma.sql`${docFilter} AND d."createdAt" >= ${new Date(filters.uploadedAfter)}`;
     }
     if (filters.uploadedBefore) {
-      docFilter = Prisma.sql`${docFilter} AND d.created_at <= ${new Date(filters.uploadedBefore)}`;
+      docFilter = Prisma.sql`${docFilter} AND d."createdAt" <= ${new Date(filters.uploadedBefore)}`;
     }
 
     try {
@@ -190,15 +190,15 @@ export class SearchService {
           d.id AS document_id,
           d.title AS document_title,
           d.category::text AS document_category,
-          dc.page_number,
-          dc.section_title,
+          dc."pageNumber" AS page_number,
+          dc."sectionTitle" AS section_title,
           dc.content,
           GREATEST(
             ts_rank(to_tsvector('english', dc.content), plainto_tsquery('english', ${cleanQuery})),
             CASE WHEN dc.content ILIKE ${'%' + cleanQuery + '%'} THEN 0.75 ELSE 0 END
           ) AS keyword_score
         FROM document_chunks dc
-        JOIN documents d ON dc.document_id = d.id
+        JOIN documents d ON dc."documentId" = d.id
         WHERE (
           to_tsvector('english', dc.content) @@ plainto_tsquery('english', ${cleanQuery})
           OR dc.content ILIKE ${'%' + cleanQuery + '%'}

@@ -26,7 +26,7 @@ export class LanguageDetectionStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 6: LANGUAGE_DETECTION`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 46);
 
     const ocrResults = ctx.ocrResults ?? [];
@@ -49,7 +49,7 @@ export class LanguageDetectionStage extends BaseStage {
       },
     });
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
     this.logger.log(
       `[${ctx.documentId}] Stage 6 DONE — lang=${ctx.primaryLanguage}`,
     );

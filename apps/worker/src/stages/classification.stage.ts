@@ -30,7 +30,7 @@ export class ClassificationStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 7: DOCUMENT_CLASSIFICATION`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 50);
 
     // Concatenate OCR text from all pages
@@ -57,9 +57,16 @@ export class ClassificationStage extends BaseStage {
       },
     });
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
     this.logger.log(
-      `[${ctx.documentId}] Stage 7 DONE — category=${category} confidence=${confidence.toFixed(2)}`,
+      `[${ctx.documentId}] Stage 7 DONE — category=${category} | confidence=${(confidence * 100).toFixed(1)}%`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 7 DETAILS:\n` +
+      `  category    : ${category}\n` +
+      `  confidence  : ${(confidence * 100).toFixed(1)}%\n` +
+      `  ocrTextLen  : ${ocrText.length} chars\n` +
+      `  ocrSample   : "${ocrText.substring(0, 200).replace(/\n/g, ' ')}..."`,
     );
   }
 }

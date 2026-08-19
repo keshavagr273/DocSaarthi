@@ -33,7 +33,7 @@ export class ImagePreprocessingStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 4: IMAGE_PREPROCESSING`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 22);
 
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -59,6 +59,10 @@ export class ImagePreprocessingStage extends BaseStage {
           .toBuffer();
 
         preprocessedBuffers[pageNum] = processed;
+
+        this.logger.debug(
+          `[${ctx.documentId}] S4 page ${pageNum}: raw=${(rawBuffer.length / 1024).toFixed(1)}KB → processed=${(processed.length / 1024).toFixed(1)}KB PNG`,
+        );
       } catch (err) {
         this.logger.warn(
           `[${ctx.documentId}] Preprocessing failed for page ${pageNum}: ${String(err)}. Using raw.`,
@@ -76,9 +80,18 @@ export class ImagePreprocessingStage extends BaseStage {
 
     ctx.preprocessedBuffers = preprocessedBuffers;
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
+    const count = Object.keys(preprocessedBuffers).length;
+    const totalBytes = Object.values(preprocessedBuffers).reduce((s, b) => s + b.length, 0);
     this.logger.log(
-      `[${ctx.documentId}] Stage 4 DONE — preprocessed ${Object.keys(preprocessedBuffers).length} pages`,
+      `[${ctx.documentId}] Stage 4 DONE — preprocessed ${count} pages | ` +
+      `total buffer=${(totalBytes / 1024).toFixed(1)}KB`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 4 DETAILS:\n` +
+      Object.entries(preprocessedBuffers)
+        .map(([pg, buf]) => `  page ${pg}: ${(buf.length / 1024).toFixed(1)}KB`)
+        .join('\n'),
     );
   }
 }

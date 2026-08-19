@@ -32,29 +32,36 @@ export class TextNormalizationStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 8: TEXT_NORMALIZATION`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 56);
 
     const ocrResults = ctx.ocrResults ?? [];
     const normalizedPages: string[] = [];
+    const updatePromises: Promise<unknown>[] = [];
 
     for (const result of ocrResults) {
       const normalized = this.normalizeText(result.rawText);
       normalizedPages.push(normalized);
 
-      // Update rawText in DB with normalized version
-      await this.db.ocrResult.updateMany({
-        where: { versionId: ctx.versionId, pageNumber: result.pageNumber },
-        data: { rawText: normalized },
-      });
+      // Update rawText in DB with normalized version (concurrently)
+      updatePromises.push(
+        this.db.ocrResult.updateMany({
+          where: { versionId: ctx.versionId, pageNumber: result.pageNumber },
+          data: { rawText: normalized },
+        }),
+      );
 
       // Also normalize the blocks' text in memory
       result.rawText = normalized;
     }
 
+    if (updatePromises.length > 0) {
+      await Promise.all(updatePromises);
+    }
+
     ctx.normalizedText = normalizedPages.join('\n\n').trim();
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
     this.logger.log(
       `[${ctx.documentId}] Stage 8 DONE — normalized ${normalizedPages.length} pages`,
     );

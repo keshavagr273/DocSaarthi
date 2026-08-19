@@ -29,25 +29,31 @@ export class PdfRenderingStage extends BaseStage {
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
-    this.logger.log(`[${ctx.documentId}] Stage 3: PDF_RENDERING (pages=${ctx.pageCount})`);
-    await this.markStageProcessing(ctx.versionId);
+    this.logger.log(`[${ctx.documentId}] Stage 3: PDF_RENDERING`);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 14);
 
     const pageIds: Record<number, string> = {};
     const pageStorageKeys: Record<number, string> = {};
 
-    if (ctx.mimeType === 'application/pdf') {
+    const isPdf =
+      ctx.mimeType === 'application/pdf' ||
+      (!ctx.mimeType && ctx.storageKey?.toLowerCase().endsWith('.pdf'));
+
+    if (isPdf) {
       const pdfBuffer = await this.storage.downloadBuffer(ctx.storageKey);
-      const { fromBuffer } = await import('pdf2pic');
+      // Cache the buffer in ctx so Stage 5 (OCR) can reuse it without a re-download
+      ctx.pdfBuffer = pdfBuffer;
+      const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+      const { createCanvas } = await import('@napi-rs/canvas');
 
-      const pageCount = ctx.pageCount ?? 1;
-
-      const converter = fromBuffer(pdfBuffer, {
-        density: 300,
-        format: 'png',
-        width: 2480, // A4 at 300 DPI ≈ 2480px wide
-        height: 3508,
+      const loadingTask = pdfjs.getDocument({
+        data: new Uint8Array(pdfBuffer),
+        useSystemFonts: true,
+        disableFontFace: true,
       });
+      const doc = await loadingTask.promise;
+      const pageCount = doc.numPages;
 
       for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
         await this.reportProgress(job, 14 + Math.round((pageNum / pageCount) * 6));
@@ -57,19 +63,19 @@ export class PdfRenderingStage extends BaseStage {
         let pageBuffer: Buffer;
 
         try {
-          const result = await converter(pageNum, { responseType: 'buffer' });
-          if (!result.buffer) throw new Error('No buffer from pdf2pic');
-          pageBuffer = result.buffer;
+          const page = await doc.getPage(pageNum);
+          const viewport = page.getViewport({ scale: 2.0 }); // 2x scale for sharp text OCR and UI viewing
+          const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
+          const canvasContext = canvas.getContext('2d');
 
-          // Get dimensions
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const sharp = require('sharp') as typeof import('sharp');
-          const meta = await sharp(pageBuffer).metadata();
-          width = meta.width ?? 0;
-          height = meta.height ?? 0;
+          await page.render({ canvasContext, viewport }).promise;
+          // Note: @napi-rs/canvas PNG encoding does not expose compressionLevel in types;
+          // the library uses a fast default internally
+          pageBuffer = canvas.toBuffer('image/png');
+          width = Math.round(viewport.width);
+          height = Math.round(viewport.height);
         } catch (err) {
           this.logger.warn(`Failed to render page ${pageNum}: ${String(err)}`);
-          // Create an empty buffer and continue — OCR will produce empty results
           pageBuffer = Buffer.alloc(0);
         }
 
@@ -99,6 +105,10 @@ export class PdfRenderingStage extends BaseStage {
 
         pageIds[pageNum] = page.id;
         pageStorageKeys[pageNum] = pageKey;
+
+        this.logger.debug(
+          `[${ctx.documentId}] S3 page ${pageNum}: ${width}x${height}px → ${(pageBuffer.length / 1024).toFixed(1)}KB PNG → ${pageKey}`,
+        );
       }
     } else {
       // Single-page image — use original as the page
@@ -140,9 +150,16 @@ export class PdfRenderingStage extends BaseStage {
     ctx.pageIds = pageIds;
     ctx.pageStorageKeys = pageStorageKeys;
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
+    const renderedCount = Object.keys(pageStorageKeys).length;
     this.logger.log(
-      `[${ctx.documentId}] Stage 3 DONE — rendered ${Object.keys(pageStorageKeys).length} pages`,
+      `[${ctx.documentId}] Stage 3 DONE — rendered ${renderedCount} pages (pdfBuffer cached=${!!ctx.pdfBuffer})`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 3 DETAILS:\n` +
+      Object.entries(pageStorageKeys)
+        .map(([pg, key]) => `  page ${pg}: ${key}`)
+        .join('\n'),
     );
   }
 

@@ -23,7 +23,9 @@ export class QueueService {
 
   async enqueueDocumentProcessing(data: DocumentProcessingJobData): Promise<string> {
     const job = await this.documentQueue.add(JOBS.PROCESS_DOCUMENT, data, {
-      jobId: `doc-${data.documentId}-v${data.versionId}`,
+      jobId: `doc-${data.documentId}-v${data.versionId}-${Date.now()}`,
+      removeOnComplete: 100,
+      removeOnFail: 100,
     });
 
     this.logger.log(

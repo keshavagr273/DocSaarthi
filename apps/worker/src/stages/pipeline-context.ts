@@ -70,6 +70,22 @@ export interface PipelineContext {
   mimeType: string;
   requestId?: string;
 
+  /**
+   * In-memory cache of stageHistory entries.
+   * Populated lazily from DB on first isAlreadyCompleted check, then
+   * maintained in memory for all subsequent stage marker calls.
+   * This eliminates the read-modify-write DB pattern in BaseStage.
+   */
+  stageHistory?: Array<{
+    stage: string;
+    status: string;
+    timestamp: string;
+    errorCode?: string;
+    errorMessage?: string;
+    startedAt?: string;
+    completedAt?: string;
+  }>;
+
   // ── Stage 1: FILE_VALIDATION ─────────────────────────────────────
   pageCount?: number;
   fileSizeBytes?: number;
@@ -83,6 +99,11 @@ export interface PipelineContext {
   pageIds?: Record<number, string>;
   /** Storage keys for rendered page PNGs, keyed by pageNumber */
   pageStorageKeys?: Record<number, string>;
+  /**
+   * Raw PDF buffer downloaded from MinIO during Stage 3.
+   * Stored here so Stage 5 (OCR) can reuse it without a redundant MinIO fetch.
+   */
+  pdfBuffer?: Buffer;
 
   // ── Stage 4: IMAGE_PREPROCESSING ────────────────────────────────
   /** Preprocessed image buffers in memory, keyed by pageNumber */

@@ -9,13 +9,31 @@ import type { DocumentProcessingJobData } from '../processors/document.processor
 // We use a dynamic import for pdfjs-dist because it ships as ESM in v4+
 // and we need to handle it carefully at runtime
 async function getPdfPageCount(buffer: Buffer): Promise<number> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfParse = require('pdf-parse') as (
-    buf: Buffer,
-    opts?: object,
-  ) => Promise<{ numpages: number }>;
-  const data = await pdfParse(buffer, { max: 0 }); // max:0 = parse metadata only
-  return data.numpages;
+  try {
+    const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const loadingTask = pdfjs.getDocument({
+      data: new Uint8Array(buffer),
+      useSystemFonts: true,
+      disableFontFace: true,
+    });
+    const doc = await loadingTask.promise;
+    return doc.numPages || 1;
+  } catch {
+    // Fallback: regex scan for /Type /Page
+    const text = buffer.toString('latin1');
+    const pageMatches = text.match(/\/Type\s*\/Page[^s]/g);
+    if (pageMatches && pageMatches.length > 0) {
+      return pageMatches.length;
+    }
+    const countMatch = text.match(/\/Count\s+(\d+)/);
+    if (countMatch && countMatch[1]) {
+      const parsed = parseInt(countMatch[1], 10);
+      if (!isNaN(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    return 1;
+  }
 }
 
 /**
@@ -43,7 +61,7 @@ export class FileValidationStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 1: FILE_VALIDATION`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 2);
 
     const maxPages = parseInt(process.env['MAX_PAGES_PER_DOCUMENT'] ?? '100', 10);
@@ -62,6 +80,10 @@ export class FileValidationStage extends BaseStage {
     let pageCount = 1;
     if (ctx.mimeType === 'application/pdf') {
       const buffer = await this.storage.downloadBuffer(ctx.storageKey);
+
+      // Cache the buffer immediately — Stages 2 (file-storage), 3 (pdf-rendering),
+      // and 5 (OCR) will all reuse this instead of re-downloading from MinIO.
+      ctx.pdfBuffer = buffer;
 
       // Basic corruption check — PDF files start with %PDF
       if (!buffer.subarray(0, 4).toString().startsWith('%PDF')) {
@@ -98,7 +120,19 @@ export class FileValidationStage extends BaseStage {
       },
     });
 
-    await this.markStageCompleted(ctx.versionId);
-    this.logger.log(`[${ctx.documentId}] Stage 1 DONE — pages=${pageCount}`);
+    this.markStageCompleted(ctx.versionId, ctx);
+    this.logger.log(
+      `[${ctx.documentId}] Stage 1 DONE — pages=${pageCount} | ` +
+      `size=${(ctx.fileSizeBytes! / 1024).toFixed(1)}KB | ` +
+      `mime=${ctx.mimeType} | checksum=${ctx.checksum?.substring(0, 12)}...`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 1 DETAILS:\n` +
+      `  storageKey   : ${ctx.storageKey}\n` +
+      `  fileSizeBytes: ${ctx.fileSizeBytes} (${(ctx.fileSizeBytes! / 1024 / 1024).toFixed(2)} MB)\n` +
+      `  pageCount    : ${ctx.pageCount}\n` +
+      `  checksum     : ${ctx.checksum}\n` +
+      `  mimeType     : ${ctx.mimeType}`,
+    );
   }
 }

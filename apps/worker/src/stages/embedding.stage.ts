@@ -13,6 +13,27 @@ const EMBEDDING_BATCH_SIZE = 50; // OpenAI allows up to 2048 inputs, but keep ba
 const EMBEDDING_CACHE_TTL_SECONDS = 86400; // 24 hours
 
 /**
+ * Module-level Redis singleton for embedding cache.
+ * Created lazily on first use and reused across all document processing jobs,
+ * avoiding the ~200-300ms cold-connection overhead per document.
+ */
+let sharedRedisClient: Redis | null = null;
+
+function getSharedRedis(): Redis | null {
+  if (sharedRedisClient) return sharedRedisClient;
+  try {
+    const redisUrl = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
+    sharedRedisClient = new Redis(redisUrl);
+    sharedRedisClient.on('error', () => {
+      sharedRedisClient = null;
+    });
+    return sharedRedisClient;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Stage 13: EMBEDDING
  *
  * Generates OpenAI text-embedding-3-small embeddings for all document chunks.
@@ -23,7 +44,6 @@ const EMBEDDING_CACHE_TTL_SECONDS = 86400; // 24 hours
 export class EmbeddingStage extends BaseStage {
   protected readonly stageName = ProcessingStage.EMBEDDING;
   protected readonly logger = new Logger(EmbeddingStage.name);
-  private redisClient: Redis | null = null;
 
   constructor(
     db: DatabaseService,
@@ -37,7 +57,7 @@ export class EmbeddingStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 13: EMBEDDING`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 84);
 
     const chunkIds = ctx.chunkIds ?? [];
@@ -46,17 +66,17 @@ export class EmbeddingStage extends BaseStage {
     if (chunkIds.length === 0) {
       this.logger.warn(`[${ctx.documentId}] No chunks to embed`);
       ctx.embeddings = [];
-      await this.markStageCompleted(ctx.versionId);
+      this.markStageCompleted(ctx.versionId, ctx);
       return;
     }
 
     // Delete existing embeddings (idempotency)
     await this.db.$executeRaw`
-      DELETE FROM document_embeddings WHERE version_id = ${ctx.versionId}
+      DELETE FROM document_embeddings WHERE "versionId" = ${ctx.versionId}
     `;
 
-    // Connect to Redis for caching
-    await this.connectRedis();
+    // Use the shared Redis singleton — no per-job connect/disconnect overhead
+    const redis = getSharedRedis();
 
     const allEmbeddings: Float32Array[] = [];
 
@@ -72,7 +92,7 @@ export class EmbeddingStage extends BaseStage {
       for (let j = 0; j < batchChunks.length; j++) {
         const content = batchChunks[j]!.content;
         const cacheKey = this.getCacheKey(content);
-        const cached = await this.getCached(cacheKey);
+        const cached = await this.getCached(redis, cacheKey);
         if (cached) {
           cachedEmbeddings.set(j, cached);
         } else {
@@ -99,7 +119,7 @@ export class EmbeddingStage extends BaseStage {
           embedding = generatedEmbeddings[genIdx++]!;
           // Cache for future use
           const cacheKey = this.getCacheKey(content);
-          await this.setCached(cacheKey, embedding);
+          await this.setCached(redis, cacheKey, embedding);
         }
 
         allEmbeddings.push(embedding);
@@ -107,7 +127,7 @@ export class EmbeddingStage extends BaseStage {
         // Store in DB via raw SQL (pgvector requires this)
         const vectorStr = `[${Array.from(embedding).join(',')}]`;
         await this.db.$executeRaw`
-          INSERT INTO document_embeddings (id, chunk_id, document_id, version_id, model, dimension, embedding, created_at)
+          INSERT INTO document_embeddings (id, "chunkId", "documentId", "versionId", model, dimension, embedding, "createdAt")
           VALUES (
             gen_random_uuid()::text,
             ${chunkId},
@@ -130,10 +150,20 @@ export class EmbeddingStage extends BaseStage {
 
     ctx.embeddings = allEmbeddings;
 
-    await this.disconnectRedis();
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
+    const batchCount = Math.ceil(chunks.length / EMBEDDING_BATCH_SIZE);
     this.logger.log(
-      `[${ctx.documentId}] Stage 13 DONE — embedded ${allEmbeddings.length} chunks`,
+      `[${ctx.documentId}] Stage 13 DONE — embedded ${allEmbeddings.length} chunks | ` +
+      `batches=${batchCount} | model=text-embedding-3-small | dim=1536 | redisConnected=${!!redis}`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 13 DETAILS:\n` +
+      `  totalChunks     : ${chunks.length}\n` +
+      `  embeddingsStored: ${allEmbeddings.length}\n` +
+      `  batchSize       : ${EMBEDDING_BATCH_SIZE}\n` +
+      `  batchCount      : ${batchCount}\n` +
+      `  embeddingModel  : text-embedding-3-small (dim 1536)\n` +
+      `  redisCacheActive: ${!!redis}`,
     );
   }
 
@@ -144,10 +174,10 @@ export class EmbeddingStage extends BaseStage {
     return `docsaarthi:embed:${hash}`;
   }
 
-  private async getCached(key: string): Promise<Float32Array | null> {
+  private async getCached(redis: Redis | null, key: string): Promise<Float32Array | null> {
     try {
-      if (!this.redisClient) return null;
-      const value = await this.redisClient.get(key);
+      if (!redis) return null;
+      const value = await redis.get(key);
       if (!value) return null;
       const arr = JSON.parse(value) as number[];
       return new Float32Array(arr);
@@ -156,37 +186,13 @@ export class EmbeddingStage extends BaseStage {
     }
   }
 
-  private async setCached(key: string, embedding: Float32Array): Promise<void> {
+  private async setCached(redis: Redis | null, key: string, embedding: Float32Array): Promise<void> {
     try {
-      if (!this.redisClient) return;
+      if (!redis) return;
       const value = JSON.stringify(Array.from(embedding));
-      await this.redisClient.set(key, value, 'EX', EMBEDDING_CACHE_TTL_SECONDS);
+      await redis.set(key, value, 'EX', EMBEDDING_CACHE_TTL_SECONDS);
     } catch {
       // Cache miss is acceptable
-    }
-  }
-
-  private async connectRedis(): Promise<void> {
-    try {
-      const redisUrl = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
-      this.redisClient = new Redis(redisUrl);
-      this.redisClient.on('error', () => {
-        this.redisClient = null;
-      });
-    } catch {
-      this.logger.warn('Could not connect to Redis — embedding cache disabled');
-      this.redisClient = null;
-    }
-  }
-
-  private async disconnectRedis(): Promise<void> {
-    try {
-      if (this.redisClient) {
-        this.redisClient.disconnect();
-        this.redisClient = null;
-      }
-    } catch {
-      // ok
     }
   }
 }

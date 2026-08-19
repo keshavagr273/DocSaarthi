@@ -4,6 +4,7 @@ import { DatabaseService, ProcessingStage } from '@docsaarthi/database';
 import { BaseStage } from './base.stage';
 import { OcrClientService } from '../services/ocr-client.service';
 import { LlmService } from '../services/llm.service';
+import { StorageClientService } from '../services/storage-client.service';
 import type { PipelineContext, OcrPageResult, OcrBlock } from './pipeline-context';
 import type { DocumentProcessingJobData } from '../processors/document.processor';
 
@@ -24,6 +25,7 @@ export class OcrStage extends BaseStage {
     db: DatabaseService,
     private readonly ocrClient: OcrClientService,
     private readonly llm: LlmService,
+    private readonly storage: StorageClientService,
   ) {
     super(db);
   }
@@ -33,7 +35,7 @@ export class OcrStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 5: OCR (with VLM Fallback)`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 30);
 
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -41,11 +43,21 @@ export class OcrStage extends BaseStage {
 
     const preprocessedBuffers = ctx.preprocessedBuffers ?? {};
     const pageIds = ctx.pageIds ?? {};
-    const pageNumbers = Object.keys(preprocessedBuffers).map(Number).sort((a, b) => a - b);
+
+    // If preprocessedBuffers is empty (e.g., lost context on retry), fall back to
+    // iterating over known pageIds so PDF direct-extraction / VLM fallback still runs
+    const pageNumbers =
+      Object.keys(preprocessedBuffers).length > 0
+        ? Object.keys(preprocessedBuffers).map(Number).sort((a, b) => a - b)
+        : Object.keys(pageIds).map(Number).sort((a, b) => a - b);
+
+    // If we have no page info at all, try page 1 for single-page documents
+    const effectivePageNumbers =
+      pageNumbers.length > 0 ? pageNumbers : [1];
 
     const ocrResults: OcrPageResult[] = [];
 
-    for (const pageNum of pageNumbers) {
+    for (const pageNum of effectivePageNumbers) {
       const buffer = preprocessedBuffers[pageNum] ?? Buffer.alloc(0);
 
       await this.reportProgress(
@@ -53,97 +65,165 @@ export class OcrStage extends BaseStage {
         30 + Math.round((pageNum / (pageNumbers.length || 1)) * 14),
       );
 
-      let result: OcrPageResult;
+      let result: OcrPageResult | null = null;
 
-      if (buffer.length === 0) {
-        this.logger.warn(`[${ctx.documentId}] Empty buffer for page ${pageNum}, skipping OCR`);
-        result = {
-          pageNumber: pageNum,
-          width: 0,
-          height: 0,
-          blocks: [],
-          rawText: '',
-          pageConfidence: 0,
-          pageLanguage: 'unknown',
-          processingTimeMs: 0,
-          fallbackUsed: true,
-        };
-      } else {
-        // Step 1: Run standard OCR
-        const paddleResult = await this.ocrClient.recognizePage(buffer, pageNum);
+      const isPdf =
+        ctx.mimeType === 'application/pdf' ||
+        (!ctx.mimeType && ctx.storageKey?.toLowerCase().endsWith('.pdf'));
 
-        // Step 2: Check if VLM Fallback is required (< 0.70 confidence or fallback was flagged or 0 blocks)
-        if (paddleResult.pageConfidence < 0.70 || paddleResult.fallbackUsed || paddleResult.blocks.length === 0) {
-          this.logger.log(
-            `[${ctx.documentId}] Page ${pageNum} confidence=${paddleResult.pageConfidence.toFixed(2)}. Triggering VLM OCR Fallback...`,
-          );
+      // ── Step 1: For PDFs, try direct text layer extraction first ──
+      if (isPdf) {
+        try {
+          const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+          // Reuse the PDF buffer already downloaded by Stage 3 (PdfRenderingStage)
+          // to avoid a redundant MinIO network round-trip per page.
+          const pdfBuf = ctx.pdfBuffer ?? await this.storage.downloadBuffer(ctx.storageKey);
+          const doc = await pdfjs.getDocument({
+            data: new Uint8Array(pdfBuf),
+            useSystemFonts: true,
+            disableFontFace: true,
+          }).promise;
+          const page = await doc.getPage(pageNum);
+          const textContent = await page.getTextContent();
+          // CRITICAL FIX: Use scale 2.0 to match the rendered PNG dimensions
+          // stored in documentPages.width/height (PdfRenderingStage renders at 2.0).
+          // Without this, bbox coordinates are in 1x space while the frontend divides
+          // by 2x page dimensions → all overlays appear shifted to the left/top.
+          const viewport = page.getViewport({ scale: 2.0 });
 
-          // Get image dimensions for coordinate scaling
-          let width = paddleResult.width || 1000;
-          let height = paddleResult.height || 1400;
-          try {
-            const meta = await sharp(buffer).metadata();
-            width = meta.width ?? width;
-            height = meta.height ?? height;
-          } catch {
-            // keep defaults
+          const textParts: string[] = [];
+          const blocks: OcrBlock[] = [];
+          let order = 0;
+
+          for (const rawItem of textContent.items) {
+            const item = rawItem as { str?: string; transform?: number[]; width?: number; height?: number };
+            if (item.str && item.str.trim()) {
+              textParts.push(item.str);
+              const tx = item.transform ? item.transform[4] || 0 : 0;
+              const ty = item.transform ? item.transform[5] || 0 : 0;
+              const fontHeight = item.transform
+                ? Math.max(Math.abs(item.transform[0] || 0), Math.abs(item.transform[3] || 0), 10)
+                : 10;
+              const itemWidth = item.width || 50;
+
+              // Convert PDF space rectangle to viewport space (canvas pixel coordinates)
+              const rect = viewport.convertToViewportRectangle([tx, ty, tx + itemWidth, ty + fontHeight]);
+              const vx1 = Math.min(rect[0], rect[2]);
+              const vy1 = Math.min(rect[1], rect[3]);
+              const vx2 = Math.max(rect[0], rect[2]);
+              const vy2 = Math.max(rect[1], rect[3]);
+
+              blocks.push({
+                id: `pdf-b-${pageNum}-${order++}`,
+                text: item.str,
+                bbox: [Math.round(vx1), Math.round(vy1), Math.round(vx2), Math.round(vy2)],
+                confidence: 0.99,
+                readingOrder: order,
+                blockType: 'text',
+              });
+            }
           }
 
-          const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
+          const rawText = textParts.join(' ');
 
-          // If VLM extracted text, prefer it; otherwise keep paddleResult
-          if (vlmResult.blocks.length > 0) {
-            result = vlmResult;
+          if (rawText.trim().length > 0) {
+            this.logger.log(
+              `[${ctx.documentId}] Direct PDF extraction succeeded for page ${pageNum}: ${blocks.length} blocks`,
+            );
+            result = {
+              pageNumber: pageNum,
+              width: Math.round(viewport.width),
+              height: Math.round(viewport.height),
+              blocks,
+              rawText,
+              pageConfidence: 0.98,
+              pageLanguage: 'en',
+              processingTimeMs: 50,
+              fallbackUsed: false,
+            };
+          }
+        } catch (pdfErr) {
+          this.logger.warn(`Direct PDF extraction error on page ${pageNum}: ${String(pdfErr)}`);
+        }
+      }
+
+      // ── Step 2: Fall back to image-based OCR (PaddleOCR / VLM) ────
+      if (!result) {
+        if (buffer.length > 0) {
+          // Try PaddleOCR sidecar
+          const paddleResult = await this.ocrClient.recognizePage(buffer, pageNum);
+
+          if (paddleResult.pageConfidence < 0.70 || paddleResult.fallbackUsed || paddleResult.blocks.length === 0) {
+            this.logger.log(
+              `[${ctx.documentId}] Page ${pageNum} confidence=${paddleResult.pageConfidence.toFixed(2)}. Attempting VLM OCR...`,
+            );
+
+            let width = paddleResult.width || 1000;
+            let height = paddleResult.height || 1400;
+            try {
+              const meta = await sharp(buffer).metadata();
+              width = meta.width ?? width;
+              height = meta.height ?? height;
+            } catch {
+              // keep defaults
+            }
+
+            try {
+              const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
+              if (vlmResult.blocks.length > 0) {
+                result = vlmResult;
+              } else {
+                result = paddleResult;
+              }
+            } catch {
+              result = paddleResult;
+            }
           } else {
             result = paddleResult;
           }
         } else {
-          // Step 3: High overall confidence, but refine individual low-confidence blocks (< 0.65)
-          result = paddleResult;
-          const lowConfidenceBlocks = result.blocks.filter((b) => b.confidence < 0.65);
-
-          if (lowConfidenceBlocks.length > 0 && lowConfidenceBlocks.length <= 5) {
-            this.logger.log(
-              `[${ctx.documentId}] Refining ${lowConfidenceBlocks.length} low-confidence blocks on page ${pageNum}`,
-            );
-
-            try {
-              const meta = await sharp(buffer).metadata();
-              const imgW = meta.width ?? 1000;
-              const imgH = meta.height ?? 1400;
-
-              for (const block of lowConfidenceBlocks) {
-                const [x1, y1, x2, y2] = block.bbox;
-                const cropLeft = Math.max(0, Math.min(imgW - 1, Math.round(x1)));
-                const cropTop = Math.max(0, Math.min(imgH - 1, Math.round(y1)));
-                const cropWidth = Math.max(10, Math.min(imgW - cropLeft, Math.round(x2 - x1)));
-                const cropHeight = Math.max(10, Math.min(imgH - cropTop, Math.round(y2 - y1)));
-
-                if (cropWidth > 5 && cropHeight > 5) {
-                  const cropBuffer = await sharp(buffer)
-                    .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
-                    .png()
-                    .toBuffer();
-
-                  const refined = await this.llm.refineBlockWithVision(cropBuffer, block.text);
-                  block.text = refined.text;
-                  block.confidence = refined.confidence;
-                }
-              }
-
-              // Recompute page confidence and raw text
-              result.rawText = result.blocks.map((b: OcrBlock) => b.text).join('\n');
-              result.pageConfidence = Number(
-                (result.blocks.reduce((s: number, b: OcrBlock) => s + b.confidence, 0) / result.blocks.length).toFixed(4),
-              );
-            } catch (cropErr) {
-              this.logger.warn(`Failed to crop low-confidence blocks: ${String(cropErr)}`);
-            }
-          }
+          this.logger.warn(`[${ctx.documentId}] Empty buffer for page ${pageNum}, returning empty OCR result`);
+          result = {
+            pageNumber: pageNum,
+            width: 0,
+            height: 0,
+            blocks: [],
+            rawText: '',
+            pageConfidence: 0,
+            pageLanguage: 'unknown',
+            processingTimeMs: 0,
+            fallbackUsed: true,
+          };
         }
       }
 
+      // Sanitize null bytes (\u0000) which are invalid in PostgreSQL UTF-8 text columns
+      const sanitizedRawText = (result.rawText ?? '').replace(/\0/g, '');
+      const sanitizedBlocks = (result.blocks ?? []).map((b) => ({
+        ...b,
+        text: (b.text ?? '').replace(/\0/g, ''),
+      }));
+      result.rawText = sanitizedRawText;
+      result.blocks = sanitizedBlocks;
+
       ocrResults.push(result);
+
+      // ── Per-page debug summary ────────────────────────────────────
+      const method = !result.fallbackUsed
+        ? (Object.keys(preprocessedBuffers).length === 0 || result.pageConfidence >= 0.98
+            ? 'pdf-direct'
+            : 'paddle')
+        : 'vlm-fallback';
+      const textSample = result.rawText.replace(/\n/g, ' ').substring(0, 80);
+      this.logger.log(
+        `[${ctx.documentId}] OCR page ${result.pageNumber}: ` +
+        `method=${method} | blocks=${result.blocks.length} | ` +
+        `confidence=${(result.pageConfidence * 100).toFixed(1)}% | ` +
+        `chars=${result.rawText.length} | lang=${result.pageLanguage}`,
+      );
+      this.logger.debug(
+        `[${ctx.documentId}] OCR page ${result.pageNumber} TEXT SAMPLE:\n  "${textSample}${result.rawText.length > 80 ? '...' : ''}"`,
+      );
 
       // Delete existing OCR result for this page (idempotency on retry) then create fresh
       await this.db.ocrResult.deleteMany({
@@ -154,8 +234,8 @@ export class OcrStage extends BaseStage {
           versionId: ctx.versionId,
           pageId: pageIds[pageNum] ?? null,
           pageNumber: pageNum,
-          rawText: result.rawText,
-          blocks: result.blocks as unknown as object[],
+          rawText: sanitizedRawText,
+          blocks: sanitizedBlocks as unknown as object[],
           pageConfidence: result.pageConfidence,
           pageLanguage: result.pageLanguage,
           ocrProvider: result.fallbackUsed ? 'vlm' : 'paddle',
@@ -179,11 +259,22 @@ export class OcrStage extends BaseStage {
 
     ctx.ocrResults = ocrResults;
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
+    const avgConf = this.avgConfidence(ocrResults);
+    const fallbacks = ocrResults.filter((r) => r.fallbackUsed).length;
+    const totalChars = ocrResults.reduce((s, r) => s + r.rawText.length, 0);
+    const totalBlocks = ocrResults.reduce((s, r) => s + r.blocks.length, 0);
     this.logger.log(
-      `[${ctx.documentId}] Stage 5 DONE — OCR'd ${ocrResults.length} pages, ` +
-        `avg confidence=${this.avgConfidence(ocrResults).toFixed(2)}, ` +
-        `fallbacks=${ocrResults.filter((r) => r.fallbackUsed).length}`,
+      `[${ctx.documentId}] Stage 5 DONE — OCR'd ${ocrResults.length} pages | ` +
+      `avgConf=${(avgConf * 100).toFixed(1)}% | fallbacks=${fallbacks} | ` +
+      `totalBlocks=${totalBlocks} | totalChars=${totalChars}`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 5 PAGE BREAKDOWN:\n` +
+      ocrResults.map((r) =>
+        `  page ${r.pageNumber}: ${r.blocks.length} blocks | ${(r.pageConfidence * 100).toFixed(1)}% | ` +
+        `${r.pageLanguage} | fallback=${r.fallbackUsed} | ${r.rawText.length} chars`
+      ).join('\n'),
     );
   }
 

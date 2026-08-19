@@ -51,10 +51,11 @@ Thumbs.db
 prisma/generated/
 generated/
 
-# Python / OCR Output / Temp
+# Python / OCR Output / Temp / Scratch
 __pycache__/
 *.py[cod]
 *$py.class
 output/
 tmp/
 temp/
+*.mjs

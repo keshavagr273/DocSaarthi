@@ -31,7 +31,7 @@ export class FileStorageStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 2: FILE_STORAGE`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 8);
 
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -41,8 +41,8 @@ export class FileStorageStage extends BaseStage {
     let thumbnailBuffer: Buffer;
 
     if (ctx.mimeType === 'application/pdf') {
-      // For PDF: render first page at 150 DPI using pdf2pic
-      thumbnailBuffer = await this.renderPdfThumbnail(ctx.storageKey);
+      // Reuse the PDF buffer already downloaded by Stage 1 (FileValidationStage)
+      thumbnailBuffer = await this.renderPdfThumbnail(ctx.storageKey, ctx.pdfBuffer);
     } else {
       // For images: resize and convert
       const original = await this.storage.downloadBuffer(ctx.storageKey);
@@ -61,38 +61,52 @@ export class FileStorageStage extends BaseStage {
       data: { thumbnailStorageKey: thumbnailKey },
     });
 
-    await this.markStageCompleted(ctx.versionId);
-    this.logger.log(`[${ctx.documentId}] Stage 2 DONE — thumbnail=${thumbnailKey}`);
+    this.markStageCompleted(ctx.versionId, ctx);
+    this.logger.log(
+      `[${ctx.documentId}] Stage 2 DONE — thumbnail=${thumbnailKey} | ` +
+      `bufferSize=${(thumbnailBuffer.length / 1024).toFixed(1)}KB`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 2 DETAILS:\n` +
+      `  thumbnailKey        : ${thumbnailKey}\n` +
+      `  thumbnailBufferBytes: ${thumbnailBuffer.length}\n` +
+      `  sourceType          : ${ctx.mimeType === 'application/pdf' ? 'pdf-first-page' : 'image-resize'}`,
+    );
   }
 
-  private async renderPdfThumbnail(storageKey: string): Promise<Buffer> {
+  private async renderPdfThumbnail(storageKey: string, cachedBuffer?: Buffer): Promise<Buffer> {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const sharp = require('sharp') as typeof import('sharp');
-    const { fromBuffer } = await import('pdf2pic');
-
-    const pdfBuffer = await this.storage.downloadBuffer(storageKey);
+    // Reuse the cached buffer from Stage 1 if available; otherwise download
+    const pdfBuffer = cachedBuffer ?? await this.storage.downloadBuffer(storageKey);
 
     try {
-      const converter = fromBuffer(pdfBuffer, {
-        density: 150,
-        format: 'png',
-        width: 800,
-        height: 1200,
+      const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+      const { createCanvas } = await import('@napi-rs/canvas');
+
+      const loadingTask = pdfjs.getDocument({
+        data: new Uint8Array(pdfBuffer),
+        useSystemFonts: true,
+        disableFontFace: true,
       });
+      const doc = await loadingTask.promise;
+      const page = await doc.getPage(1);
+      const viewport = page.getViewport({ scale: 1.0 });
+      const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
+      const canvasContext = canvas.getContext('2d');
 
-      const page = await converter(1, { responseType: 'buffer' });
-      if (!page.buffer) throw new Error('pdf2pic returned no buffer');
+      await page.render({ canvasContext, viewport }).promise;
+      const pngBuffer = canvas.toBuffer('image/png');
 
-      const thumbnailBuffer = await sharp(page.buffer)
+      const thumbnailBuffer = await sharp(pngBuffer)
         .resize(400, null, { withoutEnlargement: true, fit: 'inside' })
         .webp({ quality: 80 })
         .toBuffer();
 
       return thumbnailBuffer;
     } catch (err) {
-      this.logger.warn(`pdf2pic thumbnail failed, using placeholder: ${String(err)}`);
-      // Return a 1x1 white WebP as placeholder if rendering fails
-      return sharp({ create: { width: 1, height: 1, channels: 3, background: '#ffffff' } })
+      this.logger.warn(`PDF thumbnail rendering failed: ${String(err)}`);
+      return sharp({ create: { width: 400, height: 560, channels: 3, background: '#1e293b' } })
         .webp()
         .toBuffer();
     }

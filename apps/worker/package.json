@@ -4,8 +4,8 @@
   "private": true,
   "scripts": {
     "build": "nest build",
-    "dev": "nest start --watch",
-    "start": "node dist/main",
+    "dev": "nest start --watch --entryFile apps/worker/src/main",
+    "start": "node dist/apps/worker/src/main.js",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit"
   },

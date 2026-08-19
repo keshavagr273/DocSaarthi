@@ -27,7 +27,7 @@ export class ConfidenceScoringStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 10: CONFIDENCE_SCORING`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 68);
 
     const fields = ctx.extractedFields ?? [];
@@ -41,6 +41,8 @@ export class ConfidenceScoringStage extends BaseStage {
       where: { documentId: ctx.documentId, isRejected: false },
       select: { id: true, fieldName: true, rawValue: true, confidence: true },
     });
+
+    const updatePromises: Promise<unknown>[] = [];
 
     for (const dbField of dbFields) {
       const ctxField = fields.find((f) => f.fieldName === dbField.fieldName);
@@ -57,13 +59,15 @@ export class ConfidenceScoringStage extends BaseStage {
       const clampedConfidence = Math.min(1, Math.max(0, finalConfidence));
       const confidenceLevel = this.toLevel(clampedConfidence);
 
-      await this.db.documentField.update({
-        where: { id: dbField.id },
-        data: {
-          confidence: clampedConfidence,
-          confidenceLevel: confidenceLevel as never,
-        },
-      });
+      updatePromises.push(
+        this.db.documentField.update({
+          where: { id: dbField.id },
+          data: {
+            confidence: clampedConfidence,
+            confidenceLevel: confidenceLevel as never,
+          },
+        }),
+      );
 
       // Keep ctx in sync
       if (ctxField) {
@@ -71,10 +75,30 @@ export class ConfidenceScoringStage extends BaseStage {
       }
     }
 
-    await this.markStageCompleted(ctx.versionId);
+    if (updatePromises.length > 0) {
+      await Promise.all(updatePromises);
+    }
+
+    this.markStageCompleted(ctx.versionId, ctx);
     this.logger.log(
-      `[${ctx.documentId}] Stage 10 DONE — rescored ${dbFields.length} fields`,
+      `[${ctx.documentId}] Stage 10 DONE — rescored ${dbFields.length} fields | ` +
+      `ocrBlocks=${allBlocks.length}`,
     );
+
+    if (dbFields.length > 0) {
+      const colW = Math.max(...dbFields.map((f) => f.fieldName.length), 12);
+      const rescoredLines = dbFields.map((f) => {
+        const ctxField = fields.find((cf) => cf.fieldName === f.fieldName);
+        const before = (f.confidence * 100).toFixed(0);
+        const after = ctxField ? (ctxField.confidence * 100).toFixed(0) : before;
+        const delta = ctxField ? ctxField.confidence - f.confidence : 0;
+        const arrow = delta > 0.01 ? '↑' : delta < -0.01 ? '↓' : '=';
+        return `  ${f.fieldName.padEnd(colW)}  before=${before}%  after=${after}%  ${arrow}`;
+      });
+      this.logger.debug(
+        `[${ctx.documentId}] Stage 10 CONFIDENCE DELTAS:\n` + rescoredLines.join('\n'),
+      );
+    }
   }
 
   /**

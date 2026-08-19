@@ -35,14 +35,14 @@ export class ChunkingStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 12: CHUNKING`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 78);
 
     const ocrResults = ctx.ocrResults ?? [];
     if (ocrResults.length === 0) {
       ctx.chunks = [];
       ctx.chunkIds = [];
-      await this.markStageCompleted(ctx.versionId);
+      this.markStageCompleted(ctx.versionId, ctx);
       return;
     }
 
@@ -60,33 +60,49 @@ export class ChunkingStage extends BaseStage {
       chunkIndex += pageChunks.length;
     }
 
-    // Insert chunks into DB
-    const chunkIds: string[] = [];
-    for (const chunk of allChunks) {
-      const created = await this.db.documentChunk.create({
-        data: {
-          versionId: ctx.versionId,
-          documentId: ctx.documentId,
-          chunkIndex: chunk.chunkIndex,
-          content: chunk.content,
-          pageNumber: chunk.pageNumber,
-          sectionTitle: chunk.sectionTitle ?? null,
-          tokenCount: chunk.tokenCount,
-          charCount: chunk.charCount,
-          language: chunk.language ?? null,
-        },
-      });
-      chunkIds.push(created.id);
-    }
+    // Bulk insert all chunks in one query instead of N sequential creates
+    await this.db.documentChunk.createMany({
+      data: allChunks.map((chunk) => ({
+        versionId: ctx.versionId,
+        documentId: ctx.documentId,
+        chunkIndex: chunk.chunkIndex,
+        content: (chunk.content ?? '').replace(/\0/g, ''),
+        pageNumber: chunk.pageNumber,
+        sectionTitle: chunk.sectionTitle ? chunk.sectionTitle.replace(/\0/g, '') : null,
+        tokenCount: chunk.tokenCount,
+        charCount: chunk.charCount,
+        language: chunk.language ?? null,
+      })),
+    });
+
+    // Retrieve the inserted IDs in order
+    const insertedChunks = await this.db.documentChunk.findMany({
+      where: { versionId: ctx.versionId },
+      orderBy: { chunkIndex: 'asc' },
+      select: { id: true },
+    });
+    const chunkIds = insertedChunks.map((c) => c.id);
 
     ctx.chunks = allChunks;
     ctx.chunkIds = chunkIds;
 
-    await this.markStageCompleted(ctx.versionId);
+    this.markStageCompleted(ctx.versionId, ctx);
+    const avgTokens = allChunks.length > 0
+      ? Math.round(allChunks.reduce((s, c) => s + c.tokenCount, 0) / allChunks.length)
+      : 0;
     this.logger.log(
-      `[${ctx.documentId}] Stage 12 DONE — ${allChunks.length} chunks, ` +
-        `avg tokens=${allChunks.length > 0 ? Math.round(allChunks.reduce((s, c) => s + c.tokenCount, 0) / allChunks.length) : 0}`,
+      `[${ctx.documentId}] Stage 12 DONE — ${allChunks.length} chunks | avgTokens=${avgTokens} | ids=${chunkIds.length}`,
     );
+    if (allChunks.length > 0) {
+      const chunkLines = allChunks.map((c, i) =>
+        `  [${i}] page=${c.pageNumber} | tokens=${c.tokenCount} | chars=${c.charCount}` +
+        (c.sectionTitle ? ` | section="${c.sectionTitle}"` : '') +
+        ` | "${c.content.replace(/\n/g, ' ').substring(0, 60)}..."`
+      );
+      this.logger.debug(
+        `[${ctx.documentId}] Stage 12 CHUNK BREAKDOWN:\n` + chunkLines.join('\n'),
+      );
+    }
   }
 
   /**

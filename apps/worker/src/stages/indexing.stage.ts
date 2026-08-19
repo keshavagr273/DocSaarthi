@@ -27,13 +27,13 @@ export class IndexingStage extends BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void> {
     this.logger.log(`[${ctx.documentId}] Stage 14: INDEXING`);
-    await this.markStageProcessing(ctx.versionId);
+    this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 92);
 
     // ── 1. Verify embeddings exist ────────────────────────────────
     const embeddingCount = await this.db.$queryRaw<
       [{ count: bigint }]
-    >`SELECT COUNT(*) as count FROM document_embeddings WHERE version_id = ${ctx.versionId}`;
+    >`SELECT COUNT(*) as count FROM document_embeddings WHERE "versionId" = ${ctx.versionId}`;
 
     const count = Number(embeddingCount[0]?.count ?? 0);
     const chunkCount = (ctx.chunkIds ?? []).length;
@@ -55,7 +55,7 @@ export class IndexingStage extends BaseStage {
       >`
         SELECT COUNT(*) > 0 as valid
         FROM document_chunks
-        WHERE version_id = ${ctx.versionId}
+        WHERE "versionId" = ${ctx.versionId}
           AND to_tsvector('english', content) @@ plainto_tsquery('english', 'the')
         LIMIT 1
       `;
@@ -66,7 +66,19 @@ export class IndexingStage extends BaseStage {
       this.logger.log(`[${ctx.documentId}] FTS index: ${ftsValid ? 'ok' : 'no matches (normal)'}`);
     }
 
-    await this.markStageCompleted(ctx.versionId);
-    this.logger.log(`[${ctx.documentId}] Stage 14 DONE — indexing verified`);
+    this.markStageCompleted(ctx.versionId, ctx);
+    this.logger.log(
+      `[${ctx.documentId}] Stage 14 DONE — indexing verified | ` +
+      `embeddings=${count}/${chunkCount} chunks | ` +
+      `coverage=${chunkCount > 0 ? ((count / chunkCount) * 100).toFixed(0) : 0}%`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 14 DETAILS:\n` +
+      `  versionId      : ${ctx.versionId}\n` +
+      `  embeddingCount : ${count}\n` +
+      `  chunkCount     : ${chunkCount}\n` +
+      `  coverage       : ${chunkCount > 0 ? ((count / chunkCount) * 100).toFixed(1) : 0}%\n` +
+      `  ftsIndexStatus : ok`,
+    );
   }
 }
