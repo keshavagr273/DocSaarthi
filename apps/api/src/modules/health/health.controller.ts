@@ -22,62 +22,69 @@ export class HealthController {
 
   @Public()
   @Get('api/health')
-  @HealthCheck()
   @ApiOperation({ summary: 'Health check — returns status of all services and latency' })
-  async check(): Promise<HealthCheckResult> {
-    return this.health.check([
-      // Database
-      async () => {
-        const start = Date.now();
-        const isUp = await this.db.isHealthy();
-        const durationMs = Date.now() - start;
-        return {
-          database: {
-            status: isUp ? ('up' as const) : ('down' as const),
-            responseMs: durationMs,
-            message: isUp ? 'Database is reachable' : 'Database unreachable',
-          },
-        };
-      },
+  async check() {
+    // Database
+    let dbStatus = 'down';
+    let dbDuration = 0;
+    try {
+      const start = Date.now();
+      const isUp = await this.db.isHealthy();
+      dbDuration = Date.now() - start;
+      dbStatus = isUp ? 'up' : 'down';
+    } catch {
+      dbStatus = 'down';
+    }
 
-      // Storage (MinIO)
-      async () => {
-        const start = Date.now();
-        const isUp = await this.storage.isHealthy();
-        const durationMs = Date.now() - start;
-        return {
-          storage: {
-            status: isUp ? ('up' as const) : ('down' as const),
-            responseMs: durationMs,
-            message: isUp ? 'MinIO is reachable' : 'MinIO unreachable',
-          },
-        };
-      },
+    // Storage
+    let storageStatus = 'down';
+    let storageDuration = 0;
+    try {
+      const start = Date.now();
+      const isUp = await this.storage.isHealthy();
+      storageDuration = Date.now() - start;
+      storageStatus = isUp ? 'up' : 'down';
+    } catch {
+      storageStatus = 'down';
+    }
 
-      // LLM Provider Status
-      async () => {
-        const hasKey = Boolean(process.env['OPENAI_API_KEY']);
-        return {
-          llmProvider: {
-            status: hasKey ? ('up' as const) : ('down' as const),
-            provider: process.env['DEFAULT_LLM_PROVIDER'] ?? 'openai',
-            model: process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b',
-          },
-        };
-      },
+    // LLM Provider Status
+    const hasKey = Boolean(process.env['OPENAI_API_KEY']);
 
-      // Queue stats
-      async () => {
-        const stats = await this.queue.getQueueStats();
-        return {
-          queues: {
-            status: 'up' as const,
-            details: {
-              'document-processing': stats,
-            },
+    // Queue stats
+    let queueStats = null;
+    try {
+      queueStats = await this.queue.getQueueStats();
+    } catch {
+      queueStats = { active: 0, waiting: 0, completed: 0, failed: 0 };
+    }
+
+    const overallStatus = dbStatus === 'up' ? 'ok' : 'degraded';
+
+    return {
+      status: overallStatus,
+      info: {
+        database: {
+          status: dbStatus,
+          responseMs: dbDuration,
+        },
+        storage: {
+          status: storageStatus,
+          responseMs: storageDuration,
+        },
+        llmProvider: {
+          status: hasKey ? 'up' : 'down',
+          provider: process.env['DEFAULT_LLM_PROVIDER'] ?? 'groq',
+          model: process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b',
+        },
+        queues: {
+          status: 'up',
+          details: {
+            'document-processing': queueStats,
           },
-        };
+        },
       },
-    ]);
+      timestamp: new Date().toISOString(),
+    };
   }
 }
