@@ -54,12 +54,13 @@ function Sidebar({ onClose }: { onClose?: () => void }) {
     <aside className="flex flex-col h-full w-64 bg-surface-50 border-r border-white/[0.06]">
       {/* Logo */}
       <div className="flex items-center gap-3 px-6 py-5 border-b border-white/[0.06]">
-        <div className="p-2 rounded-lg bg-brand-600/20 border border-brand-500/30 shrink-0">
-          <FileText className="w-5 h-5 text-brand-400" />
+        <div className="w-8 h-8 rounded-lg overflow-hidden border border-brand-500/30 shrink-0 bg-surface-100 flex items-center justify-center">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/logo.png" alt="DocSaarthi Logo" className="w-full h-full object-cover" />
         </div>
         <div>
-          <span className="font-bold text-white">DocSaarthi</span>
-          <p className="text-[10px] text-white/30 leading-tight">Document Intelligence</p>
+          <span className="font-bold text-white tracking-wide">DocSaarthi</span>
+          <p className="text-[10px] text-white/40 leading-tight">दस्तावेज़ सारथी</p>
         </div>
         {onClose && (
           <button onClick={onClose} className="ml-auto text-white/30 hover:text-white lg:hidden">

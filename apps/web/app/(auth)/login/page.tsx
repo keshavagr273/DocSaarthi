@@ -54,12 +54,13 @@ export default function LoginPage() {
       <div className="relative w-full max-w-md animate-slide-up">
         {/* Logo */}
         <div className="flex items-center justify-center gap-3 mb-8">
-          <div className="p-2.5 rounded-xl bg-brand-600/20 border border-brand-500/30">
-            <FileText className="w-7 h-7 text-brand-400" />
+          <div className="w-12 h-12 rounded-2xl overflow-hidden border border-brand-500/30 bg-surface-100 shadow-xl shadow-brand-500/10">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/logo.png" alt="DocSaarthi Logo" className="w-full h-full object-cover" />
           </div>
           <div>
             <h1 className="text-2xl font-bold text-gradient">DocSaarthi</h1>
-            <p className="text-xs text-white/40 -mt-0.5">Document Intelligence Platform</p>
+            <p className="text-xs text-white/40 -mt-0.5">दस्तावेज़ सारथी — Document Intelligence</p>
           </div>
         </div>
 

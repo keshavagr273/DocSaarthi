@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.jpg" alt="DocSaarthi Logo" width="130" style="border-radius: 28px; box-shadow: 0 16px 36px rgba(0,0,0,0.5);" />
+  <img src="docs/assets/logo.png" alt="DocSaarthi Logo" width="130" style="border-radius: 28px; box-shadow: 0 16px 36px rgba(0,0,0,0.5);" />
   <h1 align="center">DocSaarthi (दस्तावेज़ सारथी)</h1>
   <p align="center">
     <strong>AI-Powered Multilingual Document Intelligence Platform</strong><br/>
