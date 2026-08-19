@@ -13,6 +13,15 @@ export interface AuditEventInput {
   requestId?: string;
 }
 
+export interface QueryAuditLogsDto {
+  eventType?: string;
+  resourceType?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+  limit?: number;
+}
+
 @Injectable()
 export class AuditService {
   private readonly logger = new Logger(AuditService.name);
@@ -38,5 +47,45 @@ export class AuditService {
       // Audit log failure should never break the main request
       this.logger.error(`Failed to write audit log [${input.eventType}]: ${String(err)}`);
     }
+  }
+
+  async queryAuditLogs(userId: string, filters: QueryAuditLogsDto) {
+    const page = Math.max(1, filters.page ?? 1);
+    const limit = Math.min(50, Math.max(1, filters.limit ?? 20));
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.AuditLogWhereInput = {
+      actorId: userId,
+      ...(filters.eventType ? { eventType: filters.eventType } : {}),
+      ...(filters.resourceType ? { resourceType: filters.resourceType } : {}),
+      ...(filters.dateFrom || filters.dateTo
+        ? {
+            createdAt: {
+              ...(filters.dateFrom ? { gte: new Date(filters.dateFrom) } : {}),
+              ...(filters.dateTo ? { lte: new Date(filters.dateTo) } : {}),
+            },
+          }
+        : {}),
+    };
+
+    const [logs, total] = await Promise.all([
+      this.db.auditLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.db.auditLog.count({ where }),
+    ]);
+
+    return {
+      logs,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
   }
 }

@@ -213,6 +213,37 @@ export const conversationsApi = {
     ),
 };
 
+export const settingsApi = {
+  updateProfile: (data: { name?: string; preferredLanguage?: string }) =>
+    api.patch<{ data: User }>('/settings/profile', data),
+
+  changePassword: (data: { currentPassword: string; newPassword: string }) =>
+    api.post<{ data: { message: string } }>('/settings/password', data),
+
+  listApiKeys: () =>
+    api.get<{ data: ApiKeyItem[] }>('/settings/api-keys'),
+
+  createApiKey: (data: { name: string; expiresInDays?: number }) =>
+    api.post<{ data: ApiKeyItem & { key: string } }>('/settings/api-keys', data),
+
+  revokeApiKey: (keyId: string) =>
+    api.delete<{ data: { message: string } }>(`/settings/api-keys/${keyId}`),
+
+  getDashboardStats: () =>
+    api.get<{ data: DashboardStatsResponse }>('/settings/dashboard-stats'),
+};
+
+export const auditLogsApi = {
+  list: (params?: {
+    eventType?: string;
+    resourceType?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    page?: number;
+    limit?: number;
+  }) => api.get<{ data: AuditLogsResponse }>('/audit-logs', { params }),
+};
+
 // ── Types ─────────────────────────────────────────────────────
 
 export interface User {
@@ -471,4 +502,47 @@ export interface ConversationDetail {
   messages: MessageItem[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ApiKeyItem {
+  id: string;
+  name: string;
+  keyPrefix: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  createdAt: string;
+}
+
+export interface AuditLogItem {
+  id: string;
+  eventType: string;
+  resourceType: string;
+  resourceId: string;
+  createdAt: string;
+  document?: { title: string } | null;
+}
+
+export interface AuditLogsResponse {
+  logs: AuditLogItem[];
+  pagination: { page: number; limit: number; total: number; totalPages: number };
+}
+
+export interface DashboardStatsResponse {
+  stats: {
+    totalDocuments: number;
+    processingCount: number;
+    completedCount: number;
+    failedCount: number;
+    needsReviewFieldsCount: number;
+    totalStorageBytes: number;
+  };
+  categoryBreakdown: Array<{ category: string; count: number }>;
+  recentAuditLogs: AuditLogItem[];
+  upcomingDeadlines: Array<{
+    id: string;
+    fieldName: string;
+    rawValue: string;
+    documentId: string;
+    document: { title: string; category: string | null };
+  }>;
 }

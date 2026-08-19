@@ -1,0 +1,208 @@
+version: '3.9'
+
+services:
+  # ── PostgreSQL 16 with pgvector ────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: docsaarthi-postgres-prod
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-docsaarthi}
+      POSTGRES_USER: ${POSTGRES_USER:-docsaarthi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docsaarthi_prod_secret}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U docsaarthi -d docsaarthi']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+    restart: unless-stopped
+
+  # ── Redis 7 ───────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: docsaarthi-redis-prod
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_prod_data:/data
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    restart: unless-stopped
+
+  # ── MinIO Object Storage ───────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: docsaarthi-minio-prod
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-docsaarthi_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-docsaarthi_minio_secret}
+    volumes:
+      - minio_prod_data:/data
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # ── MinIO Init ────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: docsaarthi-minio-init-prod
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 docsaarthi_minio docsaarthi_minio_secret;
+      /usr/bin/mc mb --ignore-existing local/docsaarthi;
+      /usr/bin/mc anonymous set none local/docsaarthi;
+      exit 0;
+      "
+    restart: on-failure
+
+  # ── PaddleOCR Sidecar ─────────────────────────────────────────
+  paddle-ocr:
+    build:
+      context: ./docker/paddle-ocr
+      dockerfile: Dockerfile
+    container_name: docsaarthi-paddle-ocr-prod
+    ports:
+      - '8081:8081'
+    volumes:
+      - ocr_models_prod:/root/.paddleocr
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8081/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+    restart: unless-stopped
+
+  # ── DocSaarthi NestJS API ─────────────────────────────────────
+  api:
+    build:
+      context: ../
+      dockerfile: apps/api/Dockerfile
+    container_name: docsaarthi-api-prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DATABASE_URL=postgresql://docsaarthi:docsaarthi_prod_secret@postgres:5432/docsaarthi?schema=public
+      - REDIS_URL=redis://redis:6379
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=docsaarthi
+      - S3_ACCESS_KEY=docsaarthi_minio
+      - S3_SECRET_KEY=docsaarthi_minio_secret
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - JWT_SECRET=${JWT_SECRET:-docsaarthi_production_jwt_secret_key_12345}
+    ports:
+      - '3001:3001'
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1024M
+    restart: unless-stopped
+
+  # ── DocSaarthi BullMQ Worker ──────────────────────────────────
+  worker:
+    build:
+      context: ../
+      dockerfile: apps/worker/Dockerfile
+    container_name: docsaarthi-worker-prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      paddle-ocr:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://docsaarthi:docsaarthi_prod_secret@postgres:5432/docsaarthi?schema=public
+      - REDIS_URL=redis://redis:6379
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=docsaarthi
+      - S3_ACCESS_KEY=docsaarthi_minio
+      - S3_SECRET_KEY=docsaarthi_minio_secret
+      - PADDLE_OCR_URL=http://paddle-ocr:8081
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+    restart: unless-stopped
+
+  # ── DocSaarthi Next.js Web Frontend ───────────────────────────
+  web:
+    build:
+      context: ../
+      dockerfile: apps/web/Dockerfile
+    container_name: docsaarthi-web-prod
+    depends_on:
+      - api
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - NEXT_PUBLIC_API_URL=http://localhost:3001
+    ports:
+      - '3000:3000'
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1024M
+    restart: unless-stopped
+
+volumes:
+  postgres_prod_data:
+    name: docsaarthi_postgres_prod_data
+  redis_prod_data:
+    name: docsaarthi_redis_prod_data
+  minio_prod_data:
+    name: docsaarthi_minio_prod_data
+  ocr_models_prod:
+    name: docsaarthi_ocr_models_prod
+
+networks:
+  default:
+    name: docsaarthi_prod_network

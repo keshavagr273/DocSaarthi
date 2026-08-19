@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { BullModule } from '@nestjs/bull';
+import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from '@docsaarthi/database';
 import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
@@ -12,6 +13,8 @@ import { AuditModule } from './modules/audit/audit.module';
 import { ReviewModule } from './modules/review/review.module';
 import { SearchModule } from './modules/search/search.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
+import { SettingsModule } from './modules/settings/settings.module';
+import { RateLimitGuard } from './common/guards/rate-limit.guard';
 import { envSchema } from './config/env.schema';
 
 @Module({
@@ -57,7 +60,14 @@ import { envSchema } from './config/env.schema';
     ReviewModule,
     SearchModule,
     ConversationsModule,
+    SettingsModule,
     HealthModule,
+  ],
+  providers: [
+    {
+      provide: APP_GUARD,
+      useClass: RateLimitGuard,
+    },
   ],
 })
 export class AppModule {}

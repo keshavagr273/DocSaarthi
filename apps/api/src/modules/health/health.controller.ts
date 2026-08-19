@@ -23,15 +23,18 @@ export class HealthController {
   @Public()
   @Get('api/health')
   @HealthCheck()
-  @ApiOperation({ summary: 'Health check — returns status of all services' })
+  @ApiOperation({ summary: 'Health check — returns status of all services and latency' })
   async check(): Promise<HealthCheckResult> {
     return this.health.check([
       // Database
       async () => {
+        const start = Date.now();
         const isUp = await this.db.isHealthy();
+        const durationMs = Date.now() - start;
         return {
           database: {
             status: isUp ? ('up' as const) : ('down' as const),
+            responseMs: durationMs,
             message: isUp ? 'Database is reachable' : 'Database unreachable',
           },
         };
@@ -39,11 +42,26 @@ export class HealthController {
 
       // Storage (MinIO)
       async () => {
+        const start = Date.now();
         const isUp = await this.storage.isHealthy();
+        const durationMs = Date.now() - start;
         return {
           storage: {
             status: isUp ? ('up' as const) : ('down' as const),
+            responseMs: durationMs,
             message: isUp ? 'MinIO is reachable' : 'MinIO unreachable',
+          },
+        };
+      },
+
+      // LLM Provider Status
+      async () => {
+        const hasKey = Boolean(process.env['OPENAI_API_KEY']);
+        return {
+          llmProvider: {
+            status: hasKey ? ('up' as const) : ('down' as const),
+            provider: 'openai',
+            model: process.env['DEFAULT_LLM_MODEL'] ?? 'gpt-4o-mini',
           },
         };
       },
