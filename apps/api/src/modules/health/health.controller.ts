@@ -1,9 +1,4 @@
 import { Controller, Get } from '@nestjs/common';
-import {
-  HealthCheckService,
-  HealthCheck,
-  HealthCheckResult,
-} from '@nestjs/terminus';
 import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { Public } from '../../common/decorators/public.decorator';
 import { DatabaseService } from '@docsaarthi/database';
@@ -14,7 +9,6 @@ import { QueueService } from '../queue/queue.service';
 @Controller()
 export class HealthController {
   constructor(
-    private readonly health: HealthCheckService,
     private readonly db: DatabaseService,
     private readonly storage: StorageService,
     private readonly queue: QueueService,
