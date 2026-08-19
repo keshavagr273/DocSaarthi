@@ -11,6 +11,19 @@ const api = axios.create({
 let isRefreshing = false;
 let refreshQueue: Array<(token: void) => void> = [];
 
+function setAuthCookie() {
+  if (typeof document !== 'undefined') {
+    const isSecure = window.location.protocol === 'https:';
+    document.cookie = `ds_auth=1; path=/; max-age=604800; SameSite=Lax${isSecure ? '; Secure' : ''}`;
+  }
+}
+
+function clearAuthCookie() {
+  if (typeof document !== 'undefined') {
+    document.cookie = 'ds_auth=; path=/; max-age=0; SameSite=Lax';
+  }
+}
+
 // ── Response interceptor: auto-refresh on 401 ─────────────────
 api.interceptors.response.use(
   (response) => response,
@@ -34,11 +47,13 @@ api.interceptors.response.use(
 
       try {
         await api.post('/auth/refresh');
+        setAuthCookie();
         refreshQueue.forEach((cb) => cb());
         refreshQueue = [];
         return api(originalRequest);
       } catch {
         refreshQueue = [];
+        clearAuthCookie();
         if (typeof window !== 'undefined') {
           window.location.href = '/login';
         }
@@ -57,13 +72,25 @@ export default api;
 // ── Typed API helpers ─────────────────────────────────────────
 
 export const authApi = {
-  register: (data: { name: string; email: string; password: string; preferredLanguage?: string }) =>
-    api.post<{ data: { user: User; message: string } }>('/auth/register', data),
+  register: async (data: { name: string; email: string; password: string; preferredLanguage?: string }) => {
+    const res = await api.post<{ data: { user: User; message: string } }>('/auth/register', data);
+    setAuthCookie();
+    return res;
+  },
 
-  login: (data: { email: string; password: string }) =>
-    api.post<{ data: { user: User; message: string } }>('/auth/login', data),
+  login: async (data: { email: string; password: string }) => {
+    const res = await api.post<{ data: { user: User; message: string } }>('/auth/login', data);
+    setAuthCookie();
+    return res;
+  },
 
-  logout: () => api.post('/auth/logout'),
+  logout: async () => {
+    try {
+      await api.post('/auth/logout');
+    } finally {
+      clearAuthCookie();
+    }
+  },
 
   me: () => api.get<{ data: User }>('/auth/me'),
 };

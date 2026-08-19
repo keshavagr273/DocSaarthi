@@ -23,13 +23,22 @@ export const metadata: Metadata = {
   description:
     'Upload scanned PDFs, images, and Indian documents. Extract structured data, verify with confidence scoring, and chat with your documents in Hindi and English.',
   keywords: ['document OCR', 'Hindi OCR', 'document AI', 'India', 'PDF scanner'],
+  icons: {
+    icon: [
+      { url: '/favicon.ico', sizes: 'any' },
+      { url: '/logo.png', type: 'image/png' },
+    ],
+    shortcut: '/favicon.ico',
+    apple: '/logo.png',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className="dark">
       <head>
-        <link rel="icon" href="/favicon.ico" />
+        <link rel="icon" href="/favicon.ico" sizes="any" />
+        <link rel="apple-touch-icon" href="/logo.png" />
       </head>
       <body className={`${sans.variable} ${serif.variable} font-sans bg-[#050508] text-white antialiased selection:bg-brand-500/30 selection:text-white`}>
         <Providers>{children}</Providers>
