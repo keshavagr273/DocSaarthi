@@ -17,6 +17,9 @@ async function bootstrap() {
   const config = app.get(ConfigService);
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : config.get<number>('PORT', 3001);
   const corsOrigin = config.get<string>('CORS_ORIGIN', '*');
+  const allowedOriginsList = corsOrigin === '*'
+    ? ['*']
+    : corsOrigin.split(',').map((o) => o.trim()).filter(Boolean);
 
   // ── Security ────────────────────────────────────────────────
   app.use(
@@ -27,7 +30,33 @@ async function bootstrap() {
   );
 
   app.enableCors({
-    origin: corsOrigin === '*' ? true : corsOrigin.includes(',') ? corsOrigin.split(',').map((o) => o.trim()) : corsOrigin,
+    origin: (requestOrigin, callback) => {
+      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      if (!requestOrigin) {
+        return callback(null, true);
+      }
+
+      if (allowedOriginsList.includes('*') || allowedOriginsList.includes(requestOrigin)) {
+        return callback(null, true);
+      }
+
+      // Automatically allow docsaarthi Vercel domains and localhost
+      const isAllowedVercel =
+        /^https:\/\/([a-zA-Z0-9_-]+\.)?vercel\.app$/.test(requestOrigin) &&
+        requestOrigin.toLowerCase().includes('docsaarthi');
+      const isLocalhost = /^https?:\/\/localhost(:\d+)?$/.test(requestOrigin);
+
+      if (
+        isAllowedVercel ||
+        isLocalhost ||
+        requestOrigin === 'https://docsaarthi.vercel.app' ||
+        requestOrigin === 'https://docsaarthi-web.vercel.app'
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(null, false);
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],

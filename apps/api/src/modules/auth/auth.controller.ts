@@ -144,8 +144,14 @@ export class AuthController {
       refreshTokenExpiresAt: Date;
     },
   ): void {
-    const secure = this.config.get<boolean>('COOKIE_SECURE', false);
-    const sameSite = this.config.get<'strict' | 'lax' | 'none'>('COOKIE_SAME_SITE', 'strict');
+    const isProd =
+      process.env.NODE_ENV === 'production' ||
+      this.config.get<string>('NODE_ENV') === 'production';
+    const secure = this.config.get<boolean>('COOKIE_SECURE', isProd);
+    const sameSite = this.config.get<'strict' | 'lax' | 'none'>(
+      'COOKIE_SAME_SITE',
+      isProd ? 'none' : 'lax',
+    );
 
     const baseOptions = {
       httpOnly: true,
@@ -166,7 +172,22 @@ export class AuthController {
   }
 
   private clearAuthCookies(res: Response): void {
-    res.clearCookie('access_token');
-    res.clearCookie('refresh_token', { path: '/api/v1/auth/refresh' });
+    const isProd =
+      process.env.NODE_ENV === 'production' ||
+      this.config.get<string>('NODE_ENV') === 'production';
+    const secure = this.config.get<boolean>('COOKIE_SECURE', isProd);
+    const sameSite = this.config.get<'strict' | 'lax' | 'none'>(
+      'COOKIE_SAME_SITE',
+      isProd ? 'none' : 'lax',
+    );
+
+    const baseOptions = {
+      httpOnly: true,
+      secure,
+      sameSite,
+    };
+
+    res.clearCookie('access_token', baseOptions);
+    res.clearCookie('refresh_token', { ...baseOptions, path: '/api/v1/auth/refresh' });
   }
 }
