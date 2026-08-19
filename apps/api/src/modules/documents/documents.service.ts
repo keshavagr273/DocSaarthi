@@ -382,7 +382,161 @@ export class DocumentsService {
     };
   }
 
-  // ── Update Document ──────────────────────────────────────────
+  // ── Get Pages ─────────────────────────────────────────────
+
+  async getPages(userId: string, documentId: string) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      select: { id: true },
+    });
+    if (!document) throw new NotFoundException('Document not found');
+
+    const version = await this.db.documentVersion.findFirst({
+      where: { documentId },
+      orderBy: { versionNumber: 'desc' },
+      select: { id: true },
+    });
+    if (!version) return { pages: [] };
+
+    const pages = await this.db.documentPage.findMany({
+      where: { versionId: version.id },
+      orderBy: { pageNumber: 'asc' },
+      select: {
+        id: true,
+        pageNumber: true,
+        storageKey: true,
+        width: true,
+        height: true,
+        language: true,
+        confidence: true,
+      },
+    });
+
+    return { documentId, pages };
+  }
+
+  // ── Get Page Detail ──────────────────────────────────────────
+
+  async getPage(userId: string, documentId: string, pageNum: number) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      select: { id: true },
+    });
+    if (!document) throw new NotFoundException('Document not found');
+
+    const version = await this.db.documentVersion.findFirst({
+      where: { documentId },
+      orderBy: { versionNumber: 'desc' },
+      select: { id: true },
+    });
+    if (!version) throw new NotFoundException('No version found');
+
+    const page = await this.db.documentPage.findUnique({
+      where: { versionId_pageNumber: { versionId: version.id, pageNumber: pageNum } },
+    });
+    if (!page) throw new NotFoundException(`Page ${pageNum} not found`);
+
+    const ocrResult = await this.db.ocrResult.findFirst({
+      where: { versionId: version.id, pageNumber: pageNum },
+      select: {
+        id: true,
+        pageNumber: true,
+        rawText: true,
+        blocks: true,
+        pageConfidence: true,
+        pageLanguage: true,
+        ocrProvider: true,
+        fallbackUsed: true,
+        processingTimeMs: true,
+      },
+    });
+
+    return { documentId, page, ocrResult };
+  }
+
+  // ── Get Extracted Fields ─────────────────────────────────────
+
+  async getFields(userId: string, documentId: string) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      select: {
+        id: true,
+        category: true,
+        categoryConfidence: true,
+      },
+    });
+    if (!document) throw new NotFoundException('Document not found');
+
+    const fields = await this.db.documentField.findMany({
+      where: { documentId, isRejected: false },
+      orderBy: { confidence: 'desc' },
+      select: {
+        id: true,
+        fieldName: true,
+        fieldType: true,
+        rawValue: true,
+        normalizedValue: true,
+        confidence: true,
+        confidenceLevel: true,
+        sourcePage: true,
+        sourceBbox: true,
+        isVerified: true,
+        isRejected: true,
+        extractionMethod: true,
+        createdAt: true,
+      },
+    });
+
+    // Calculate overall document confidence
+    const overallConfidence = fields.length > 0
+      ? fields.reduce((sum, f) => sum + f.confidence, 0) / fields.length
+      : null;
+
+    return {
+      documentId,
+      category: document.category,
+      categoryConfidence: document.categoryConfidence,
+      overallConfidence,
+      fields,
+    };
+  }
+
+  // ── Get Raw OCR ──────────────────────────────────────────────
+
+  async getOcr(userId: string, documentId: string) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      select: { id: true },
+    });
+    if (!document) throw new NotFoundException('Document not found');
+
+    const version = await this.db.documentVersion.findFirst({
+      where: { documentId },
+      orderBy: { versionNumber: 'desc' },
+      select: { id: true },
+    });
+    if (!version) return { documentId, pages: [] };
+
+    const ocrResults = await this.db.ocrResult.findMany({
+      where: { versionId: version.id },
+      orderBy: { pageNumber: 'asc' },
+      select: {
+        id: true,
+        pageNumber: true,
+        rawText: true,
+        blocks: true,
+        pageConfidence: true,
+        pageLanguage: true,
+        ocrProvider: true,
+        fallbackUsed: true,
+        processingTimeMs: true,
+      },
+    });
+
+    return { documentId, pages: ocrResults };
+  }
+
+  // ── Update Document ──────────────────────────────────────────────
 
   async update(userId: string, documentId: string, dto: UpdateDocumentDto) {
     const document = await this.db.document.findFirst({

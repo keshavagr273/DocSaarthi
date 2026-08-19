@@ -96,10 +96,28 @@ export const documentsApi = {
   }) => api.get<{ data: DocumentListResponse }>('/documents', { params }),
 
   get: (documentId: string) =>
-    api.get<{ data: Document }>(`/documents/${documentId}`),
+    api.get<{ data: DocumentDetail }>(`/documents/${documentId}`),
 
   getStatus: (documentId: string) =>
-    api.get<{ data: ProcessingStatus }>(`/documents/${documentId}/status`),
+    api.get<{ data: DocumentProcessingStatus }>(`/documents/${documentId}/status`),
+
+  getFields: (documentId: string) =>
+    api.get<{ data: DocumentFieldsResponse }>(`/documents/${documentId}/fields`),
+
+  getPages: (documentId: string) =>
+    api.get<{ data: { documentId: string; pages: DocumentPage[] } }>(
+      `/documents/${documentId}/pages`,
+    ),
+
+  getPage: (documentId: string, pageNum: number) =>
+    api.get<{ data: { documentId: string; page: DocumentPage; ocrResult: OcrResult | null } }>(
+      `/documents/${documentId}/pages/${pageNum}`,
+    ),
+
+  getOcr: (documentId: string) =>
+    api.get<{ data: { documentId: string; pages: OcrResult[] } }>(
+      `/documents/${documentId}/ocr`,
+    ),
 
   update: (documentId: string, data: { title?: string; tags?: string[] }) =>
     api.patch<{ data: Document }>(`/documents/${documentId}`, data),
@@ -149,18 +167,90 @@ export interface Document {
   } | null;
 }
 
+export interface DocumentDetail extends Document {
+  versions: Array<{
+    id: string;
+    versionNumber: number;
+    pageCount: number | null;
+    processingStatus: string;
+    processingStage: string;
+    startedAt: string | null;
+    completedAt: string | null;
+    processingDurationMs: number | null;
+  }>;
+  fields: DocumentField[];
+}
+
+export interface DocumentField {
+  id: string;
+  fieldName: string;
+  fieldType: string;
+  rawValue: string;
+  normalizedValue: unknown;
+  confidence: number;
+  confidenceLevel: 'HIGH' | 'MEDIUM' | 'LOW';
+  sourcePage: number | null;
+  sourceBbox: unknown;
+  isVerified: boolean;
+  isRejected: boolean;
+  extractionMethod: string | null;
+  createdAt: string;
+}
+
+export interface DocumentFieldsResponse {
+  documentId: string;
+  category: string | null;
+  categoryConfidence: number | null;
+  overallConfidence: number | null;
+  fields: DocumentField[];
+}
+
+export interface DocumentPage {
+  id: string;
+  pageNumber: number;
+  storageKey: string;
+  width: number | null;
+  height: number | null;
+  language: string | null;
+  confidence: number | null;
+}
+
+export interface OcrBlock {
+  id: string;
+  text: string;
+  bbox: [number, number, number, number];
+  confidence: number;
+  readingOrder: number;
+  blockType: string;
+}
+
+export interface OcrResult {
+  id: string;
+  pageNumber: number;
+  rawText: string;
+  blocks: OcrBlock[];
+  pageConfidence: number;
+  pageLanguage: string;
+  ocrProvider: string;
+  fallbackUsed: boolean;
+  processingTimeMs: number | null;
+}
+
 export interface DocumentListResponse {
   documents: Document[];
   pagination: { total: number; page: number; limit: number; totalPages: number };
 }
 
-export interface ProcessingStatus {
+export interface DocumentProcessingStatus {
   documentId: string;
   status: string;
   currentStage: string | null;
+  processingStatus: string | null;
   completedStages: string[];
   progress: number;
+  stageHistory: unknown;
   startedAt: string | null;
   completedAt: string | null;
   error: { message: string; code: string | null } | null;
+  retryCount: number;
 }
