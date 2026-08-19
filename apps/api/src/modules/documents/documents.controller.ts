@@ -11,7 +11,10 @@ import {
   HttpStatus,
   ParseIntPipe,
   Req,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import {
   ApiTags,
   ApiOperation,
@@ -19,6 +22,7 @@ import {
   ApiBearerAuth,
   ApiParam,
   ApiQuery,
+  ApiConsumes,
 } from '@nestjs/swagger';
 import { Request } from 'express';
 import { DocumentsService } from './documents.service';
@@ -39,6 +43,27 @@ export class DocumentsController {
   constructor(private readonly documentsService: DocumentsService) {}
 
   // ── Upload flow ────────────────────────────────────────────────────
+
+  @Post('upload-direct')
+  @HttpCode(HttpStatus.CREATED)
+  @UseInterceptors(FileInterceptor('file'))
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({ summary: 'Direct multipart file upload (Cloud & Local fallback)' })
+  @ApiResponse({ status: 201, description: 'Document uploaded and queued for processing' })
+  async uploadDirect(
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: { title?: string; tags?: string },
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request & { requestId?: string },
+  ) {
+    const tags = body.tags ? body.tags.split(',').map((t) => t.trim()) : [];
+    return this.documentsService.uploadDirect(
+      user.sub,
+      file,
+      { title: body.title, tags },
+      req.requestId,
+    );
+  }
 
   @Post()
   @HttpCode(HttpStatus.CREATED)

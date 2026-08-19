@@ -96,6 +96,30 @@ export const authApi = {
 };
 
 export const documentsApi = {
+  uploadDirect: (
+    file: File,
+    metadata?: { title?: string; tags?: string[] },
+    onProgress?: (percent: number) => void,
+  ) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (metadata?.title) formData.append('title', metadata.title);
+    if (metadata?.tags?.length) formData.append('tags', metadata.tags.join(','));
+
+    return api.post<{ data: { documentId: string; versionId: string; status: string; message: string } }>(
+      '/documents/upload-direct',
+      formData,
+      {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        onUploadProgress: (event) => {
+          if (event.total && onProgress) {
+            onProgress(Math.round((event.loaded / event.total) * 100));
+          }
+        },
+      },
+    );
+  },
+
   initiateUpload: (data: {
     fileName: string;
     mimeType: string;

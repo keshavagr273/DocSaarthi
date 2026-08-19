@@ -55,43 +55,25 @@ export default function UploadPage() {
     setErrorMessage('');
 
     try {
-      // Step 1: Initiate upload — get presigned URL
-      const { data: initiateResp } = await documentsApi.initiateUpload({
-        fileName: file.name,
-        mimeType: file.type,
-        fileSize: file.size,
-      });
-
-      const { documentId: docId, versionId, uploadUrl, uploadFields } = initiateResp.data;
-      setDocumentId(docId);
-
-      // Step 2: Upload directly to MinIO using presigned POST
-      const formData = new FormData();
-      Object.entries(uploadFields).forEach(([key, value]) => {
-        formData.append(key, String(value));
-      });
-      formData.append('file', file); // 'file' must be last
-
-      await axios.post(uploadUrl, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress: (event: AxiosProgressEvent) => {
-          if (event.total) {
-            setProgress(Math.round((event.loaded / event.total) * 100));
+      // Direct reliable upload to API endpoint (with live progress)
+      const res = await documentsApi.uploadDirect(
+        file,
+        { title: file.name },
+        (percent) => {
+          setProgress(percent);
+          if (percent === 100) {
+            setPhase('confirming');
           }
         },
-      });
+      );
 
-      setProgress(100);
-      setPhase('confirming');
-
-      // Step 3: Confirm upload — triggers processing
-      await documentsApi.confirmUpload(docId, versionId);
-
+      const docId = res.data.data.documentId;
+      setDocumentId(docId);
       setPhase('done');
       toast.success('Document uploaded and queued for processing!');
 
       // Redirect after short delay
-      setTimeout(() => router.push(`/documents/${docId}`), 1500);
+      setTimeout(() => router.push(`/documents/${docId}`), 1200);
     } catch (err: unknown) {
       setPhase('error');
       const msg =

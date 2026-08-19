@@ -29,15 +29,19 @@ export class StorageClientService implements OnModuleInit {
     this.bucket = process.env['MINIO_BUCKET'] ?? 'docsaarthi';
 
     const protocol = useSSL ? 'https' : 'http';
+    const endpointUrl =
+      port === 443 || port === 80 || !port
+        ? `${protocol}://${endpoint}`
+        : `${protocol}://${endpoint}:${port}`;
 
     this.client = new S3Client({
-      endpoint: `${protocol}://${endpoint}:${port}`,
-      region: 'us-east-1',
+      endpoint: endpointUrl,
+      region: 'auto',
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
       forcePathStyle: true,
     });
 
-    this.logger.log(`Worker storage → ${protocol}://${endpoint}:${port}/${this.bucket}`);
+    this.logger.log(`Worker storage → ${endpointUrl}/${this.bucket}`);
   }
 
   /**

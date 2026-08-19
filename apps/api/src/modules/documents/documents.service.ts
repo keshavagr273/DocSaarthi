@@ -57,6 +57,115 @@ export class DocumentsService {
     private readonly audit: AuditService,
   ) {}
 
+  // ── Direct Multipart Upload (Cloud Fallback) ────────────────
+
+  async uploadDirect(
+    userId: string,
+    file: Express.Multer.File,
+    dto: { title?: string; tags?: string[] },
+    requestId?: string,
+  ) {
+    const maxFileSize = this.config.get<number>('MAX_FILE_SIZE_BYTES', 52428800);
+
+    if (file.size > maxFileSize) {
+      throw new BadRequestException(
+        `File too large. Maximum size is ${Math.round(maxFileSize / 1024 / 1024)}MB`,
+      );
+    }
+
+    if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
+      throw new BadRequestException(
+        'File type not supported. Allowed types: PDF, PNG, JPEG, WebP',
+      );
+    }
+
+    const document = await this.db.document.create({
+      data: {
+        userId,
+        title: dto.title ?? sanitizeFilename(file.originalname),
+        originalFileName: file.originalname,
+        mimeType: file.mimetype,
+        fileSizeBytes: file.size,
+        tags: dto.tags ?? [],
+        status: DocumentStatus.QUEUED,
+        versions: {
+          create: {
+            versionNumber: 1,
+            uploadedByUserId: userId,
+            storageKey: 'PENDING',
+            fileSizeBytes: file.size,
+          },
+        },
+      },
+      include: { versions: true },
+    });
+
+    const version = document.versions[0]!;
+    const storageKey = generateStorageKey(userId, document.id, version.id, file.originalname);
+
+    // Save file buffer to storage
+    await this.storage.uploadBuffer(storageKey, file.buffer, file.mimetype);
+
+    // Update version
+    await this.db.documentVersion.update({
+      where: { id: version.id },
+      data: {
+        storageKey,
+        processingStage: ProcessingStage.FILE_VALIDATION,
+      },
+    });
+
+    await this.db.document.update({
+      where: { id: document.id },
+      data: { currentVersionId: version.id, status: DocumentStatus.QUEUED },
+    });
+
+    // Enqueue processing job
+    const processingJob = await this.db.processingJob.create({
+      data: {
+        documentId: document.id,
+        versionId: version.id,
+        queueName: 'document-processing',
+        status: 'QUEUED',
+        currentStage: ProcessingStage.FILE_VALIDATION,
+      },
+    });
+
+    const jobId = await this.queue.enqueueDocumentProcessing({
+      documentId: document.id,
+      versionId: version.id,
+      userId,
+      storageKey,
+      mimeType: file.mimetype,
+      requestId,
+    });
+
+    await this.db.processingJob.update({
+      where: { id: processingJob.id },
+      data: { bullJobId: jobId },
+    });
+
+    await this.audit.log({
+      eventType: 'DOCUMENT_UPLOAD_DIRECT',
+      actorId: userId,
+      resourceType: 'DOCUMENT',
+      resourceId: document.id,
+      documentId: document.id,
+      requestId,
+    });
+
+    this.logger.log(
+      `Direct upload completed: document=${document.id} version=${version.id} key=${storageKey}`,
+    );
+
+    return {
+      documentId: document.id,
+      versionId: version.id,
+      status: 'QUEUED',
+      message: 'Document uploaded and queued for processing',
+    };
+  }
+
   // ── Initiate Upload ──────────────────────────────────────────
 
   async initiateUpload(userId: string, dto: InitiateUploadDto, requestId?: string) {
