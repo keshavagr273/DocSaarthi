@@ -1,11 +1,23 @@
-## DocSaarthi — Quick Start Guide
+<div align="center">
+  <img src="docs/assets/logo.jpg" alt="DocSaarthi Logo" width="220" style="border-radius: 28px; box-shadow: 0 20px 40px rgba(0,0,0,0.5);" />
+  <h1 align="center">DocSaarthi (दस्तावेज़ सारथी)</h1>
+  <p align="center">
+    <strong>AI-Powered Multilingual Document Intelligence Platform</strong><br>
+    <em>Full OCR, Semantic Search, Hybrid RAG, Auto-Classification, and Schema Extraction for Hindi & English Documents</em>
+  </p>
 
-### Prerequisites
-- Node.js 20+
-- Docker + Docker Compose
-- Git
+  <p align="center">
+    <img src="https://img.shields.io/badge/OCR-PaddleOCR%20v4-blue.svg" alt="PaddleOCR" />
+    <img src="https://img.shields.io/badge/Database-PostgreSQL%20%2B%20pgvector-teal.svg" alt="pgvector" />
+    <img src="https://img.shields.io/badge/LLM-Groq%20%2B%20OpenAI-orange.svg" alt="LLM" />
+    <img src="https://img.shields.io/badge/Framework-Next.js%2015%20%2B%20NestJS-purple.svg" alt="Framework" />
+    <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License" />
+  </p>
+</div>
 
 ---
+
+## ⚡ Quick Start Guide
 
 ### 1. Clone and Install
 
