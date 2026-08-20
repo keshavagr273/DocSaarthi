@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -45,30 +45,40 @@ const SUGGESTED_QUERIES = [
 
 export default function SearchPage() {
   const [query, setQuery] = useState('');
-  const [submittedQuery, setSubmittedQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [mode, setMode] = useState<'hybrid' | 'semantic' | 'keyword'>('hybrid');
   const [selectedCategory, setSelectedCategory] = useState('ALL');
   const [selectedLang, setSelectedLang] = useState('ALL');
 
+  // Debounce query as the user types (300ms)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQuery(query.trim());
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  const effectiveQuery = debouncedQuery;
+
   const { data: searchData, isFetching } = useQuery({
-    queryKey: ['search', { q: submittedQuery, mode, category: selectedCategory, lang: selectedLang }],
+    queryKey: ['search', { q: effectiveQuery, mode, category: selectedCategory, lang: selectedLang }],
     queryFn: () =>
       searchApi
         .search({
-          q: submittedQuery,
+          q: effectiveQuery,
           mode,
           category: selectedCategory === 'ALL' ? undefined : selectedCategory,
           lang: selectedLang === 'ALL' ? undefined : selectedLang,
           limit: 20,
         })
         .then((r) => r.data.data),
-    enabled: Boolean(submittedQuery.trim()),
+    enabled: Boolean(effectiveQuery.length >= 1),
   });
 
   const handleSearch = (e?: React.FormEvent) => {
     e?.preventDefault();
     if (query.trim()) {
-      setSubmittedQuery(query.trim());
+      setDebouncedQuery(query.trim());
     }
   };
 
@@ -177,7 +187,7 @@ export default function SearchPage() {
       </div>
 
       {/* Suggested Starters when empty */}
-      {!submittedQuery && (
+      {!effectiveQuery && (
         <div className="glass p-6 rounded-2xl space-y-3">
           <p className="text-xs font-semibold text-white/40 uppercase tracking-wider flex items-center gap-1.5">
             <HelpCircle className="w-3.5 h-3.5 text-brand-400" /> Suggested Searches
@@ -188,7 +198,7 @@ export default function SearchPage() {
                 key={sq}
                 onClick={() => {
                   setQuery(sq);
-                  setSubmittedQuery(sq);
+                  setDebouncedQuery(sq);
                 }}
                 className="px-3 py-1.5 rounded-xl bg-white/[0.03] border border-white/[0.06] hover:border-brand-500/30 hover:bg-brand-600/10 text-xs text-white/70 hover:text-brand-300 transition-all text-left"
               >
@@ -200,11 +210,11 @@ export default function SearchPage() {
       )}
 
       {/* Results Header */}
-      {submittedQuery && (
+      {effectiveQuery && (
         <div className="flex items-center justify-between text-xs text-white/40 px-1">
           <span>
             Found <strong className="text-white">{results.length}</strong> results in{' '}
-            <strong className="text-white">{searchData?.searchDurationMs ?? 0}ms</strong> for &ldquo;{submittedQuery}&rdquo;
+            <strong className="text-white">{searchData?.searchDurationMs ?? 0}ms</strong> for &ldquo;{effectiveQuery}&rdquo;
           </span>
           <span className="capitalize">Mode: {mode}</span>
         </div>
@@ -216,7 +226,7 @@ export default function SearchPage() {
           <Loader2 className="w-8 h-8 animate-spin text-brand-400 mx-auto mb-3" />
           <p className="text-sm text-white/40">Executing hybrid vector search...</p>
         </div>
-      ) : submittedQuery && results.length === 0 ? (
+      ) : effectiveQuery && results.length === 0 ? (
         <div className="glass p-16 rounded-2xl text-center space-y-3">
           <Search className="w-10 h-10 text-white/20 mx-auto mb-1" />
           <h3 className="text-base font-semibold text-white">No Matching Results</h3>

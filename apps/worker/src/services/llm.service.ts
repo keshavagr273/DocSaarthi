@@ -37,8 +37,8 @@ export class LlmService {
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
       baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b';
-    this.visionModel = process.env['DEFAULT_VISION_MODEL'] ?? 'openai/gpt-oss-20b';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
+    this.visionModel = process.env['DEFAULT_VISION_MODEL'] ?? 'groq/compound-mini';
     this.embeddingModel = process.env['DEFAULT_EMBEDDING_MODEL'] ?? 'text-embedding-3-small';
   }
 

@@ -39,8 +39,8 @@ export const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
   DEFAULT_LLM_PROVIDER: z.string().default('openai'),
-  DEFAULT_LLM_MODEL: z.string().default('openai/gpt-oss-20b'),
-  DEFAULT_VISION_MODEL: z.string().default('openai/gpt-oss-20b'),
+  DEFAULT_LLM_MODEL: z.string().default('groq/compound-mini'),
+  DEFAULT_VISION_MODEL: z.string().default('groq/compound-mini'),
   DEFAULT_EMBEDDING_MODEL: z.string().default('text-embedding-3-small'),
   EMBEDDING_DIMENSION: z.coerce.number().default(1536),
 

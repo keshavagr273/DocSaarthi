@@ -28,7 +28,7 @@ export class ConversationsService {
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
       baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
   }
 
   // ── Conversation Management ───────────────────────────────────────
@@ -124,6 +124,17 @@ export class ConversationsService {
                     content: true,
                     pageNumber: true,
                     sectionTitle: true,
+                    version: {
+                      select: {
+                        document: {
+                          select: {
+                            id: true,
+                            title: true,
+                            originalFileName: true,
+                          },
+                        },
+                      },
+                    },
                   },
                 },
               },
@@ -137,7 +148,36 @@ export class ConversationsService {
       throw new NotFoundException('Conversation not found');
     }
 
-    return conversation;
+    // Collect all document IDs in citations to ensure all titles are populated
+    const docIds = new Set<string>();
+    for (const msg of conversation.messages) {
+      for (const cite of msg.citations) {
+        if (cite.documentId) docIds.add(cite.documentId);
+      }
+    }
+
+    const docs = await this.db.document.findMany({
+      where: { id: { in: Array.from(docIds) } },
+      select: { id: true, title: true, originalFileName: true },
+    });
+    const docMap = new Map(docs.map((d: { id: string; title: string; originalFileName: string }) => [d.id, d.title || d.originalFileName]));
+
+    const enrichedMessages = conversation.messages.map((m: (typeof conversation.messages)[number]) => ({
+      ...m,
+      citations: m.citations.map((c: (typeof m.citations)[number]) => ({
+        ...c,
+        documentTitle:
+          docMap.get(c.documentId) ??
+          c.chunk?.version?.document?.title ??
+          c.chunk?.version?.document?.originalFileName ??
+          'Document',
+      })),
+    }));
+
+    return {
+      ...conversation,
+      messages: enrichedMessages,
+    };
   }
 
   async deleteConversation(userId: string, conversationId: string) {
@@ -371,31 +411,30 @@ CRITICAL RULES:
     retrievedChunks: SearchResultItem[],
   ): CitationItem[] {
     const citations: CitationItem[] = [];
-    const sourceMatches = answer.match(/\[Source\s*(\d+)\]/gi);
+    // Match [Source N...], 【Source N...】, or Source N
+    const sourceRegex = /(?:\[|【)?Source\s*(\d+)[^\]】\n]*(?:\]|】)?/gi;
+    const matches = Array.from(answer.matchAll(sourceRegex));
 
-    if (sourceMatches) {
-      for (const m of sourceMatches) {
-        const numMatch = m.match(/\d+/);
-        if (numMatch) {
-          const idx = parseInt(numMatch[0]!, 10) - 1;
-          const chunk = retrievedChunks[idx];
-          if (chunk && !citations.some((c) => c.chunkId === chunk.chunkId)) {
-            citations.push({
-              chunkId: chunk.chunkId,
-              documentId: chunk.documentId,
-              documentTitle: chunk.documentTitle,
-              pageNumber: chunk.pageNumber,
-              sectionTitle: chunk.sectionTitle,
-              snippet: chunk.snippet,
-            });
-          }
+    if (matches.length > 0) {
+      for (const m of matches) {
+        const num = parseInt(m[1]!, 10);
+        const chunk = retrievedChunks[num - 1];
+        if (chunk && !citations.some((c) => c.chunkId === chunk.chunkId)) {
+          citations.push({
+            chunkId: chunk.chunkId,
+            documentId: chunk.documentId,
+            documentTitle: chunk.documentTitle,
+            pageNumber: chunk.pageNumber,
+            sectionTitle: chunk.sectionTitle,
+            snippet: chunk.snippet,
+          });
         }
       }
     }
 
-    // If no explicit [Source N] tag in text, attach top 2 chunks as source context
+    // If no explicit tags found in answer, fallback to top retrieved chunks
     if (citations.length === 0 && retrievedChunks.length > 0) {
-      return retrievedChunks.slice(0, 2).map((chunk) => ({
+      return retrievedChunks.slice(0, 3).map((chunk) => ({
         chunkId: chunk.chunkId,
         documentId: chunk.documentId,
         documentTitle: chunk.documentTitle,
