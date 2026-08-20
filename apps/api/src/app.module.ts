@@ -38,16 +38,30 @@ import { envSchema } from './config/env.schema';
     // ── Database (global) ────────────────────────────────────
     DatabaseModule,
 
-    // ── BullMQ ───────────────────────────────────────────────
+    // ── BullMQ (Supports Upstash TLS rediss:// & Local Redis) ──
     BullModule.forRootAsync({
-      useFactory: () => ({
-        redis: process.env['REDIS_URL'] ?? 'redis://localhost:6379',
-        prefix: process.env['REDIS_PREFIX'] ?? 'docsaarthi:',
-        defaultJobOptions: {
-          removeOnComplete: { count: 100 },
-          removeOnFail: { count: 200 },
-        },
-      }),
+      useFactory: () => {
+        const redisUrl = (process.env['REDIS_URL'] ?? 'redis://localhost:6379').trim();
+        const isTls = redisUrl.startsWith('rediss://');
+
+        const redisOptions = isTls
+          ? {
+              url: redisUrl,
+              tls: { rejectUnauthorized: false },
+              maxRetriesPerRequest: null,
+              enableReadyCheck: false,
+            }
+          : redisUrl;
+
+        return {
+          redis: redisOptions,
+          prefix: process.env['REDIS_PREFIX'] ?? 'docsaarthi:',
+          defaultJobOptions: {
+            removeOnComplete: { count: 100 },
+            removeOnFail: { count: 200 },
+          },
+        };
+      },
     }),
 
     // ── Feature modules ─────────────────────────────────────
