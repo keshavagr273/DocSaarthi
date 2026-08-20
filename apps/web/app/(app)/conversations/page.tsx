@@ -26,6 +26,7 @@ import {
   type CitationItem,
 } from '../../../lib/api';
 import { cn, formatDate } from '../../../lib/utils';
+import { FormattedMessage } from '../../../components/ui/formatted-message';
 import toast from 'react-hot-toast';
 
 const SUGGESTED_STARTERS = [
@@ -336,8 +337,10 @@ export default function ConversationsPage() {
                     <Bot className="w-4 h-4" />
                   </div>
                   <div className="flex-1 space-y-2">
-                    <div className="glass p-4 rounded-2xl border-white/[0.08] text-sm text-white/90 leading-relaxed whitespace-pre-wrap">
-                      {streamingText || (
+                    <div className="glass p-4 rounded-2xl border-white/[0.08] text-sm text-white/90 leading-relaxed">
+                      {streamingText ? (
+                        <FormattedMessage content={streamingText} />
+                      ) : (
                         <span className="flex items-center gap-2 text-xs text-white/40">
                           <Loader2 className="w-3.5 h-3.5 animate-spin text-brand-400" />
                           DocSaarthi is thinking & searching documents...
@@ -404,12 +407,12 @@ function ChatMessageCard({ message }: { message: MessageItem }) {
         })}
       >
         <div
-          className={cn('p-4 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap', {
+          className={cn('p-4 rounded-2xl text-sm leading-relaxed', {
             'bg-brand-600 text-white shadow-lg': isUser,
             'glass text-white/90 border-white/[0.08]': !isUser,
           })}
         >
-          {message.content}
+          <FormattedMessage content={message.content} citations={message.citations} isUser={isUser} />
         </div>
 
         {/* Citations Card (if assistant message contains citations) */}

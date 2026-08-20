@@ -1,7 +1,8 @@
 'use client';
 
-import { use, useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
+import { useParams } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft,
@@ -23,14 +24,12 @@ import {
   type CitationItem,
 } from '../../../../../lib/api';
 import { cn } from '../../../../../lib/utils';
+import { FormattedMessage } from '../../../../../components/ui/formatted-message';
 import toast from 'react-hot-toast';
 
-export default function DocumentChatPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id: documentId } = use(params);
+export default function DocumentChatPage() {
+  const routeParams = useParams();
+  const documentId = (routeParams?.['id'] ?? '') as string;
   const queryClient = useQueryClient();
 
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -246,12 +245,12 @@ export default function DocumentChatPage({
                   })}
                 >
                   <div
-                    className={cn('p-4 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap', {
+                    className={cn('p-4 rounded-2xl text-sm leading-relaxed', {
                       'bg-brand-600 text-white shadow-lg': msg.role === 'USER',
                       'glass text-white/90 border-white/[0.08]': msg.role !== 'USER',
                     })}
                   >
-                    {msg.content}
+                    <FormattedMessage content={msg.content} citations={msg.citations} isUser={msg.role === 'USER'} />
                   </div>
 
                   {msg.citations && msg.citations.length > 0 && (
@@ -288,8 +287,10 @@ export default function DocumentChatPage({
                 <div className="w-8 h-8 rounded-xl bg-brand-600/30 border border-brand-500/30 flex items-center justify-center text-brand-300 shrink-0">
                   <Bot className="w-4 h-4" />
                 </div>
-                <div className="glass p-4 rounded-2xl border-white/[0.08] text-sm text-white/90 leading-relaxed whitespace-pre-wrap flex-1">
-                  {streamingText || (
+                <div className="glass p-4 rounded-2xl border-white/[0.08] text-sm text-white/90 leading-relaxed flex-1">
+                  {streamingText ? (
+                    <FormattedMessage content={streamingText} />
+                  ) : (
                     <span className="flex items-center gap-2 text-xs text-white/40">
                       <Loader2 className="w-3.5 h-3.5 animate-spin text-brand-400" />
                       Analyzing document content...

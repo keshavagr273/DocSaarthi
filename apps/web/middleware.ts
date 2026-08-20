@@ -13,8 +13,7 @@ export function middleware(request: NextRequest) {
 
   // Redirect unauthenticated users away from protected routes to login
   if (!isPublicPath && !isAuthenticated) {
-    const url = request.nextUrl.clone();
-    url.pathname = '/login';
+    const url = new URL('/login', request.url);
     url.searchParams.set('redirect', pathname);
     return NextResponse.redirect(url);
   }

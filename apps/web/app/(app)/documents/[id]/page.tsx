@@ -1,7 +1,8 @@
 'use client';
 
-import { use, useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
+import { useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft,
@@ -148,12 +149,9 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-export default function DocumentDetailPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id: documentId } = use(params);
+export default function DocumentDetailPage() {
+  const routeParams = useParams();
+  const documentId = (routeParams?.['id'] ?? '') as string;
   const queryClient = useQueryClient();
 
   // State
