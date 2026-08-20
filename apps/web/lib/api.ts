@@ -20,7 +20,8 @@ function setAuthCookie() {
 
 function clearAuthCookie() {
   if (typeof document !== 'undefined') {
-    document.cookie = 'ds_auth=; path=/; max-age=0; SameSite=Lax';
+    document.cookie = 'ds_auth=; path=/; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax';
+    document.cookie = 'ds_auth=; path=/; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=None; Secure';
   }
 }
 

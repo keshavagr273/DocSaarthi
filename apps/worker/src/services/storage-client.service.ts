@@ -47,7 +47,7 @@ export class StorageClientService implements OnModuleInit {
       endpoint: endpointUrl,
       region: isCloudflare ? 'auto' : 'us-east-1',
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
-      forcePathStyle: !isCloudflare,
+      forcePathStyle: true,
     });
 
     this.logger.log(`Worker storage → ${endpointUrl}/${this.bucket}`);

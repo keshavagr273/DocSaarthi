@@ -19,12 +19,6 @@ export function middleware(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  // Redirect authenticated users away from login/register pages to dashboard
-  if ((pathname === '/login' || pathname === '/register') && isAuthenticated) {
-    const redirectTo = request.nextUrl.searchParams.get('redirect') ?? '/dashboard';
-    return NextResponse.redirect(new URL(redirectTo, request.url));
-  }
-
   return NextResponse.next();
 }
 

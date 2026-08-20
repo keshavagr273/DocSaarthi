@@ -57,7 +57,7 @@ export class StorageService implements OnModuleInit {
       endpoint: endpointUrl,
       region: isCloudflare ? 'auto' : 'us-east-1',
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
-      forcePathStyle: !isCloudflare, // R2 prefers virtual-hosted style or forcePathStyle depending on endpoint
+      forcePathStyle: true, // Required for both MinIO and Cloudflare R2
     });
 
     this.logger.log(`Storage connected → ${endpointUrl}/${this.bucket}`);
