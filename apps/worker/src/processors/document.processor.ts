@@ -5,7 +5,7 @@ import {
   OnQueueCompleted,
   OnQueueFailed,
 } from '@nestjs/bull';
-import { Logger } from '@nestjs/common';
+import { Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { Job } from 'bull';
 import { DatabaseService, ProcessingStatus, ProcessingStage, DocumentStatus } from '@docsaarthi/database';
 import { QUEUES, JOBS } from '@docsaarthi/shared';
@@ -44,8 +44,10 @@ export interface DocumentProcessingJobData {
  * Each stage is idempotent: on BullMQ retry, completed stages are skipped.
  */
 @Processor(QUEUES.DOCUMENT_PROCESSING)
-export class DocumentProcessor {
+export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DocumentProcessor.name);
+  private pollingTimer: NodeJS.Timeout | null = null;
+  private activeProcessingIds = new Set<string>();
 
   constructor(
     private readonly db: DatabaseService,
@@ -64,6 +66,69 @@ export class DocumentProcessor {
     private readonly embeddingStage: EmbeddingStage,
     private readonly indexingStage: IndexingStage,
   ) {}
+
+  onModuleInit(): void {
+    this.logger.log('Starting DB polling worker daemon for QUEUED documents...');
+    this.pollingTimer = setInterval(() => {
+      this.pollQueuedDocuments().catch((err) => {
+        this.logger.error('Error in DB polling worker loop:', err);
+      });
+    }, 3000);
+  }
+
+  onModuleDestroy(): void {
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
+    }
+  }
+
+  private async pollQueuedDocuments(): Promise<void> {
+    const queuedDocs = await this.db.document.findMany({
+      where: {
+        status: DocumentStatus.QUEUED,
+        currentVersionId: { not: null },
+      },
+      include: {
+        versions: true,
+      },
+      take: 3,
+      orderBy: { createdAt: 'asc' },
+    });
+
+    for (const doc of queuedDocs) {
+      if (this.activeProcessingIds.has(doc.id)) continue;
+
+      const version = doc.versions.find((v) => v.id === doc.currentVersionId) ?? doc.versions[0];
+      if (!version || version.storageKey === 'PENDING') continue;
+
+      this.activeProcessingIds.add(doc.id);
+      this.logger.log(`[DB Poller] Found queued document ${doc.id} ("${doc.title}"). Dispatching pipeline...`);
+
+      const syntheticJob = {
+        id: `poll-${doc.id}`,
+        data: {
+          documentId: doc.id,
+          versionId: version.id,
+          userId: doc.userId,
+          storageKey: version.storageKey,
+          mimeType: doc.mimeType,
+        },
+        progress: async () => {},
+        attemptsMade: 0,
+        opts: { attempts: 1 },
+      } as unknown as Job<DocumentProcessingJobData>;
+
+      // Run pipeline asynchronously so loop stays non-blocking
+      this.processDocumentJob(syntheticJob)
+        .catch((err) => {
+          this.logger.error(`[DB Poller] Processing failed for document ${doc.id}: ${String(err)}`);
+        })
+        .finally(() => {
+          this.activeProcessingIds.delete(doc.id);
+        });
+    }
+  }
 
   // ── Job lifecycle hooks ──────────────────────────────────────────
 

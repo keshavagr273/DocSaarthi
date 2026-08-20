@@ -23,11 +23,17 @@ export class QueueService {
 
   async enqueueDocumentProcessing(data: DocumentProcessingJobData): Promise<string> {
     try {
-      const job = await this.documentQueue.add(JOBS.PROCESS_DOCUMENT, data, {
+      const enqueuePromise = this.documentQueue.add(JOBS.PROCESS_DOCUMENT, data, {
         jobId: `doc-${data.documentId}-v${data.versionId}-${Date.now()}`,
         removeOnComplete: 100,
         removeOnFail: 100,
       });
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Redis queue enqueue timed out')), 3000),
+      );
+
+      const job = await Promise.race([enqueuePromise, timeoutPromise]);
 
       this.logger.log(
         `Enqueued job ${job.id} for document ${data.documentId} (version ${data.versionId})`,
