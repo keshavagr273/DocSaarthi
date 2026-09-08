@@ -76,12 +76,15 @@ export class AuthService {
     const passwordHash = await argon2.hash(dto.password, this.ARGON2_OPTIONS);
 
     // 3. Create user
+    const normalizedEmail = dto.email.toLowerCase().trim();
+    const isOwner = normalizedEmail === 'keshavagrawal273@gmail.com';
     const user = await this.db.user.create({
       data: {
-        email: dto.email.toLowerCase().trim(),
+        email: normalizedEmail,
         passwordHash,
         name: dto.name.trim(),
         preferredLanguage: dto.preferredLanguage ?? 'en',
+        role: isOwner ? ('ADMIN' as any) : ('USER' as any),
       },
     });
 
@@ -154,8 +157,18 @@ export class AuthService {
     // 3. Create session
     const session = await this.createSession(user.id, ipAddress, userAgent);
 
+    // Auto-promote owner email to ADMIN if not already
+    let userRole = user.role;
+    if (user.email.toLowerCase() === 'keshavagrawal273@gmail.com' && user.role !== 'ADMIN') {
+      userRole = 'ADMIN' as any;
+      await this.db.user.update({
+        where: { id: user.id },
+        data: { role: 'ADMIN' },
+      });
+    }
+
     // 4. Generate tokens
-    const tokens = await this.generateTokenPair(user.id, user.email, user.role, session.id);
+    const tokens = await this.generateTokenPair(user.id, user.email, userRole, session.id);
 
     // 5. Update last login timestamp
     await this.db.user.update({
@@ -311,6 +324,14 @@ export class AuthService {
 
     if (!user) {
       throw new UnauthorizedException('User not found');
+    }
+
+    if (user.email.toLowerCase() === 'keshavagrawal273@gmail.com' && user.role !== 'ADMIN') {
+      await this.db.user.update({
+        where: { id: user.id },
+        data: { role: 'ADMIN' },
+      });
+      user.role = 'ADMIN' as any;
     }
 
     return user;

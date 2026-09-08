@@ -16,6 +16,7 @@ import {
   X,
   Sparkles,
   Upload,
+  ShieldCheck,
 } from 'lucide-react';
 import { useState } from 'react';
 import { authApi, type User } from '../../lib/api';
@@ -113,6 +114,32 @@ function Sidebar({ onClose }: { onClose?: () => void }) {
             </Link>
           );
         })}
+
+        {/* Admin Navigation — Only visible for keshavagrawal273@gmail.com */}
+        {(userData?.email?.toLowerCase() === 'keshavagrawal273@gmail.com' || userData?.role === 'ADMIN') && (
+          <div className="pt-3">
+            <div className="px-3 py-1.5 text-[10px] font-semibold text-brand-400/80 uppercase tracking-widest flex items-center justify-between">
+              <span>Admin</span>
+              <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-brand-500/20 text-brand-300 font-mono">
+                SECURE
+              </span>
+            </div>
+            <Link
+              href="/admin"
+              onClick={onClose}
+              className={cn(
+                'flex items-center gap-3 px-3.5 py-2.5 rounded-full text-xs font-semibold transition-all group mt-1',
+                pathname === '/admin' || pathname.startsWith('/admin/')
+                  ? 'bg-brand-500 text-white shadow-lg shadow-brand-500/25'
+                  : 'text-brand-300/80 hover:text-white hover:bg-brand-500/10 border border-brand-500/20',
+              )}
+            >
+              <ShieldCheck className={cn('w-4 h-4 shrink-0', pathname.startsWith('/admin') ? 'text-white' : 'text-brand-400')} />
+              <span>Admin Portal</span>
+              <ChevronRight className="w-3.5 h-3.5 ml-auto text-current opacity-60" />
+            </Link>
+          </div>
+        )}
       </nav>
 
       {/* User Info Card */}

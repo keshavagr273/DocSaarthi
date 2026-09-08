@@ -603,3 +603,138 @@ export interface DashboardStatsResponse {
     document: { title: string; category: string | null };
   }>;
 }
+
+// ── Admin Interfaces ────────────────────────────────────────────────
+
+export interface AdminOverviewStats {
+  users: { total: number };
+  documents: {
+    total: number;
+    completed: number;
+    queued: number;
+    processing: number;
+    failed: number;
+    successRate: number;
+    totalBytes: number;
+  };
+  queue: {
+    waiting: number;
+    active: number;
+    completed: number;
+    failed: number;
+    delayed: number;
+    backlog: number;
+    status: 'healthy' | 'degraded';
+  };
+  timestamp: string;
+}
+
+export interface AdminUserItem {
+  id: string;
+  name: string | null;
+  email: string;
+  role: string;
+  isActive: boolean;
+  createdAt: string;
+  lastLoginAt: string | null;
+  totalDocuments: number;
+  completedDocuments: number;
+  queuedDocuments: number;
+  processingDocuments: number;
+  failedDocuments: number;
+  successRate: number;
+}
+
+export interface AdminUsersResponse {
+  items: AdminUserItem[];
+  pagination: { page: number; limit: number; total: number; totalPages: number };
+}
+
+export interface AdminUserDocumentItem {
+  id: string;
+  title: string;
+  originalFileName: string;
+  mimeType: string;
+  fileSizeBytes: number;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  latestVersion: {
+    id: string;
+    versionNumber: number;
+    processingStatus: string;
+    processingStage: string | null;
+    processingError: string | null;
+    startedAt: string | null;
+    completedAt: string | null;
+  } | null;
+}
+
+export interface AdminUserDetailResponse {
+  user: { id: string; name: string | null; email: string };
+  documents: AdminUserDocumentItem[];
+}
+
+export interface AdminDocumentItem {
+  id: string;
+  title: string;
+  originalFileName: string;
+  mimeType: string;
+  fileSizeBytes: number;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  user: { id: string; name: string | null; email: string };
+  latestVersion: {
+    id: string;
+    versionNumber: number;
+    processingStatus: string;
+    processingStage: string | null;
+    processingError: string | null;
+  } | null;
+}
+
+export interface AdminDocumentsResponse {
+  items: AdminDocumentItem[];
+  pagination: { page: number; limit: number; total: number; totalPages: number };
+}
+
+export interface AdminQueueDetails {
+  stats: {
+    waiting: number;
+    active: number;
+    completed: number;
+    failed: number;
+    delayed: number;
+  };
+  stuckDocuments: Array<{
+    id: string;
+    title: string;
+    status: string;
+    userEmail: string;
+    error: string | null;
+    updatedAt: string;
+  }>;
+  redisConfig: {
+    prefix: string;
+    isTls: boolean;
+  };
+}
+
+export const adminApi = {
+  getStats: () => api.get<AdminOverviewStats>('/admin/stats'),
+  getUsers: (params?: { search?: string; page?: number; limit?: number }) =>
+    api.get<AdminUsersResponse>('/admin/users', { params }),
+  getUserDocuments: (userId: string) =>
+    api.get<AdminUserDetailResponse>(`/admin/users/${userId}/documents`),
+  toggleUserStatus: (userId: string, isActive: boolean) =>
+    api.patch<{ id: string; email: string; isActive: boolean }>(`/admin/users/${userId}/status`, { isActive }),
+  getDocuments: (params?: { status?: string; search?: string; page?: number; limit?: number }) =>
+    api.get<AdminDocumentsResponse>('/admin/documents', { params }),
+  getQueue: () => api.get<AdminQueueDetails>('/admin/queue'),
+  retryFailedQueue: () =>
+    api.post<{ totalFound: number; retriedCount: number; errors: Array<{ id: string; error: string }>; message: string }>(
+      '/admin/queue/retry-failed',
+    ),
+};
+

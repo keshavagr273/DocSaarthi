@@ -14,6 +14,7 @@ import { ReviewModule } from './modules/review/review.module';
 import { SearchModule } from './modules/search/search.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
 import { SettingsModule } from './modules/settings/settings.module';
+import { AdminModule } from './modules/admin/admin.module';
 import { RateLimitGuard } from './common/guards/rate-limit.guard';
 import { getBullRedisConfig } from '@docsaarthi/shared';
 import { envSchema } from './config/env.schema';
@@ -67,6 +68,7 @@ import { envSchema } from './config/env.schema';
     ConversationsModule,
     SettingsModule,
     HealthModule,
+    AdminModule,
   ],
   providers: [
     {
