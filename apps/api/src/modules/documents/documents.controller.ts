@@ -90,6 +90,18 @@ export class DocumentsController {
     return this.documentsService.confirmUpload(user.sub, documentId, dto.versionId, req.requestId);
   }
 
+  @Post(':id/retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Retry processing for a stuck or failed document' })
+  @ApiParam({ name: 'id', description: 'Document ID' })
+  async retryProcessing(
+    @Param('id') documentId: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request & { requestId?: string },
+  ) {
+    return this.documentsService.retryProcessing(user.sub, documentId, req.requestId);
+  }
+
   // ── Category Override (Checkpoint 3) ───────────────────────────────
 
   @Patch(':id/category')

@@ -21,13 +21,15 @@ export class RateLimitGuard implements CanActivate {
   private isConnected = false;
 
   constructor() {
-    const redisUrl = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
+    const redisUrl = (process.env['REDIS_URL'] ?? 'redis://localhost:6379').trim();
     const prefix = process.env['REDIS_PREFIX'] ?? 'docsaarthi:';
+    const isTls = redisUrl.startsWith('rediss://');
 
     this.redisClient = new Redis(redisUrl, {
       keyPrefix: `${prefix}ratelimit:`,
       maxRetriesPerRequest: 1,
       lazyConnect: true,
+      ...(isTls ? { tls: { rejectUnauthorized: false } } : {}),
     });
 
     this.redisClient.connect().then(() => {

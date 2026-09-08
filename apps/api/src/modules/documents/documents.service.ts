@@ -5,7 +5,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DatabaseService, DocumentStatus, ProcessingStage, DocumentCategory } from '@docsaarthi/database';
+import { DatabaseService, DocumentStatus, ProcessingStage, ProcessingStatus, DocumentCategory } from '@docsaarthi/database';
 import { StorageService } from '../storage/storage.service';
 import { QueueService } from '../queue/queue.service';
 import { AuditService } from '../audit/audit.service';
@@ -121,6 +121,7 @@ export class DocumentsService {
     });
 
     // Enqueue processing job safely
+    let enqueueSuccess = false;
     try {
       const processingJob = await this.db.processingJob.create({
         data: {
@@ -145,8 +146,22 @@ export class DocumentsService {
         where: { id: processingJob.id },
         data: { bullJobId: jobId },
       });
+
+      enqueueSuccess = true;
     } catch (queueErr) {
-      this.logger.warn(`Could not enqueue to Bull queue immediately: ${String(queueErr)}`);
+      this.logger.error(`Could not enqueue to Bull queue immediately: ${String(queueErr)}`);
+      await this.db.document.update({
+        where: { id: document.id },
+        data: { status: DocumentStatus.FAILED },
+      });
+      await this.db.documentVersion.update({
+        where: { id: version.id },
+        data: {
+          processingStatus: ProcessingStatus.FAILED,
+          processingError: 'Failed to enqueue processing job. Please use the retry button.',
+          processingErrorCode: 'QUEUE_UNAVAILABLE',
+        },
+      });
     }
 
     await this.audit.log({
@@ -159,13 +174,22 @@ export class DocumentsService {
     });
 
     this.logger.log(
-      `Direct upload completed: document=${document.id} version=${version.id} key=${storageKey}`,
+      `Direct upload completed: document=${document.id} version=${version.id} key=${storageKey} enqueued=${enqueueSuccess}`,
     );
+
+    if (!enqueueSuccess) {
+      return {
+        documentId: document.id,
+        versionId: version.id,
+        status: DocumentStatus.FAILED,
+        message: 'Document uploaded to storage, but could not be queued for processing. Please retry.',
+      };
+    }
 
     return {
       documentId: document.id,
       versionId: version.id,
-      status: 'QUEUED',
+      status: DocumentStatus.QUEUED,
       message: 'Document uploaded and queued for processing',
     };
   }
@@ -312,29 +336,48 @@ export class DocumentsService {
       data: { currentVersionId: versionId, status: DocumentStatus.QUEUED },
     });
 
-    const processingJob = await this.db.processingJob.create({
-      data: {
+    let enqueueSuccess = false;
+    try {
+      const processingJob = await this.db.processingJob.create({
+        data: {
+          documentId,
+          versionId,
+          queueName: 'document-processing',
+          status: 'QUEUED',
+          currentStage: ProcessingStage.FILE_VALIDATION,
+        },
+      });
+
+      const jobId = await this.queue.enqueueDocumentProcessing({
         documentId,
         versionId,
-        queueName: 'document-processing',
-        status: 'QUEUED',
-        currentStage: ProcessingStage.FILE_VALIDATION,
-      },
-    });
+        userId,
+        storageKey: version.storageKey,
+        mimeType: document.mimeType,
+        requestId,
+      });
 
-    const jobId = await this.queue.enqueueDocumentProcessing({
-      documentId,
-      versionId,
-      userId,
-      storageKey: version.storageKey,
-      mimeType: document.mimeType,
-      requestId,
-    });
+      await this.db.processingJob.update({
+        where: { id: processingJob.id },
+        data: { bullJobId: jobId },
+      });
 
-    await this.db.processingJob.update({
-      where: { id: processingJob.id },
-      data: { bullJobId: jobId },
-    });
+      enqueueSuccess = true;
+    } catch (queueErr) {
+      this.logger.error(`Could not enqueue confirmed upload to Bull queue: ${String(queueErr)}`);
+      await this.db.document.update({
+        where: { id: documentId },
+        data: { status: DocumentStatus.FAILED },
+      });
+      await this.db.documentVersion.update({
+        where: { id: versionId },
+        data: {
+          processingStatus: ProcessingStatus.FAILED,
+          processingError: 'Failed to enqueue processing job. Please use the retry button.',
+          processingErrorCode: 'QUEUE_UNAVAILABLE',
+        },
+      });
+    }
 
     await this.audit.log({
       eventType: 'DOCUMENT_UPLOAD_CONFIRMED',
@@ -345,12 +388,121 @@ export class DocumentsService {
       requestId,
     });
 
+    if (!enqueueSuccess) {
+      return {
+        documentId,
+        versionId,
+        status: DocumentStatus.FAILED,
+        message: 'Upload confirmed, but could not be queued for processing. Please retry.',
+      };
+    }
+
     return {
       documentId,
       versionId,
-      status: 'QUEUED',
+      status: DocumentStatus.QUEUED,
       message: 'Document is queued for processing',
     };
+  }
+
+  // ── Retry Processing ──────────────────────────────────────────
+
+  async retryProcessing(userId: string, documentId: string, requestId?: string) {
+    const document = await this.db.document.findFirst({
+      where: { id: documentId, userId, isDeleted: false },
+      include: {
+        versions: {
+          orderBy: { versionNumber: 'desc' },
+          take: 1,
+        },
+      },
+    });
+
+    if (!document) {
+      throw new NotFoundException('Document not found');
+    }
+
+    const version = document.versions[0];
+    if (!version || !version.storageKey) {
+      throw new BadRequestException('No valid document version found to retry');
+    }
+
+    // Reset status to QUEUED
+    await this.db.document.update({
+      where: { id: documentId },
+      data: { status: DocumentStatus.QUEUED },
+    });
+
+    await this.db.documentVersion.update({
+      where: { id: version.id },
+      data: {
+        processingStatus: ProcessingStatus.QUEUED,
+        processingError: null,
+        processingErrorCode: null,
+        startedAt: null,
+        completedAt: null,
+      },
+    });
+
+    const processingJob = await this.db.processingJob.create({
+      data: {
+        documentId,
+        versionId: version.id,
+        queueName: 'document-processing',
+        status: 'QUEUED',
+        currentStage: ProcessingStage.FILE_VALIDATION,
+      },
+    });
+
+    try {
+      const jobId = await this.queue.enqueueDocumentProcessing({
+        documentId,
+        versionId: version.id,
+        userId,
+        storageKey: version.storageKey,
+        mimeType: document.mimeType,
+        requestId,
+      });
+
+      await this.db.processingJob.update({
+        where: { id: processingJob.id },
+        data: { bullJobId: jobId },
+      });
+
+      await this.audit.log({
+        eventType: 'DOCUMENT_PROCESSING_RETRY',
+        actorId: userId,
+        resourceType: 'DOCUMENT',
+        resourceId: documentId,
+        documentId,
+        requestId,
+      });
+
+      return {
+        documentId,
+        versionId: version.id,
+        status: DocumentStatus.QUEUED,
+        message: 'Document processing retry enqueued successfully',
+      };
+    } catch (err) {
+      this.logger.error(`Retry enqueue failed: ${String(err)}`);
+      await this.db.document.update({
+        where: { id: documentId },
+        data: { status: DocumentStatus.FAILED },
+      });
+      await this.db.documentVersion.update({
+        where: { id: version.id },
+        data: {
+          processingStatus: ProcessingStatus.FAILED,
+          processingError: 'Failed to enqueue retry processing job to worker queue',
+          processingErrorCode: 'QUEUE_UNAVAILABLE',
+        },
+      });
+
+      throw new BadRequestException(
+        'Could not enqueue processing job to queue. Please check Redis connection.',
+      );
+    }
   }
 
   // ── List Documents ───────────────────────────────────────────

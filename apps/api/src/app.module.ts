@@ -15,6 +15,7 @@ import { SearchModule } from './modules/search/search.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { RateLimitGuard } from './common/guards/rate-limit.guard';
+import { getBullRedisConfig } from '@docsaarthi/shared';
 import { envSchema } from './config/env.schema';
 
 @Module({
@@ -38,24 +39,14 @@ import { envSchema } from './config/env.schema';
     // ── Database (global) ────────────────────────────────────
     DatabaseModule,
 
-    // ── BullMQ (Supports Upstash TLS rediss:// & Local Redis) ──
+    // ── Bull Queue (Supports Upstash TLS rediss:// & Local Redis) ──
     BullModule.forRootAsync({
       useFactory: () => {
-        const redisUrl = (process.env['REDIS_URL'] ?? 'redis://localhost:6379').trim();
-        const isTls = redisUrl.startsWith('rediss://');
-
-        const redisOptions = isTls
-          ? {
-              url: redisUrl,
-              tls: { rejectUnauthorized: false },
-              maxRetriesPerRequest: null,
-              enableReadyCheck: false,
-            }
-          : redisUrl;
-
+        const config = getBullRedisConfig();
         return {
-          redis: redisOptions,
-          prefix: process.env['REDIS_PREFIX'] ?? 'docsaarthi:',
+          url: config.url,
+          redis: config.redis,
+          prefix: config.prefix,
           defaultJobOptions: {
             removeOnComplete: { count: 100 },
             removeOnFail: { count: 200 },

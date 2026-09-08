@@ -8,12 +8,14 @@ export class CacheService implements OnModuleInit, OnModuleDestroy {
   private isConnected = false;
 
   onModuleInit() {
-    const redisUrl = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
+    const redisUrl = (process.env['REDIS_URL'] ?? 'redis://localhost:6379').trim();
     const prefix = process.env['REDIS_PREFIX'] ?? 'docsaarthi:';
+    const isTls = redisUrl.startsWith('rediss://');
 
     this.redisClient = new Redis(redisUrl, {
       keyPrefix: `${prefix}cache:`,
       maxRetriesPerRequest: 2,
+      ...(isTls ? { tls: { rejectUnauthorized: false } } : {}),
       retryStrategy: (times) => {
         if (times > 3) return null;
         return Math.min(times * 100, 1000);

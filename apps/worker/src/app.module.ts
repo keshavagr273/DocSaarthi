@@ -3,7 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { BullModule } from '@nestjs/bull';
 import { HttpModule } from '@nestjs/axios';
 import { DatabaseModule } from '@docsaarthi/database';
-import { QUEUES } from '@docsaarthi/shared';
+import { QUEUES, getBullRedisConfig } from '@docsaarthi/shared';
 
 // Processor
 import { DocumentProcessor } from './processors/document.processor';
@@ -55,17 +55,21 @@ const ALL_STAGES = [
     HttpModule,
     DatabaseModule,
     BullModule.forRootAsync({
-      useFactory: () => ({
-        redis: process.env['REDIS_URL'] ?? 'redis://localhost:6379',
-        prefix: process.env['REDIS_PREFIX'] ?? 'docsaarthi:',
-        defaultJobOptions: {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 5000 },
-          timeout: 600_000, // 10 minutes per job
-          removeOnComplete: { count: 100 },
-          removeOnFail: { count: 200 },
-        },
-      }),
+      useFactory: () => {
+        const config = getBullRedisConfig();
+        return {
+          url: config.url,
+          redis: config.redis,
+          prefix: config.prefix,
+          defaultJobOptions: {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 5000 },
+            timeout: 600_000, // 10 minutes per job
+            removeOnComplete: { count: 100 },
+            removeOnFail: { count: 200 },
+          },
+        };
+      },
     }),
     BullModule.registerQueue({ name: QUEUES.DOCUMENT_PROCESSING }),
   ],

@@ -151,6 +151,11 @@ export const documentsApi = {
   getStatus: (documentId: string) =>
     api.get<{ data: DocumentProcessingStatus }>(`/documents/${documentId}/status`),
 
+  retryProcessing: (documentId: string) =>
+    api.post<{ data: { documentId: string; versionId: string; status: string; message: string } }>(
+      `/documents/${documentId}/retry`,
+    ),
+
   getFields: (documentId: string) =>
     api.get<{ data: DocumentFieldsResponse }>(`/documents/${documentId}/fields`),
 

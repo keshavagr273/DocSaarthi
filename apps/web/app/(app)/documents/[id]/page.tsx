@@ -187,6 +187,18 @@ export default function DocumentDetailPage() {
     }
   }, [status?.status, documentId, queryClient]);
 
+  const retryMutation = useMutation({
+    mutationFn: () => documentsApi.retryProcessing(documentId),
+    onSuccess: () => {
+      toast.success('Processing retry queued');
+      void queryClient.invalidateQueries({ queryKey: ['documents', documentId] });
+      void refetchStatus();
+    },
+    onError: (err: unknown) => {
+      toast.error(`Retry failed: ${err instanceof Error ? err.message : String(err)}`);
+    },
+  });
+
   // Set default version
   const currentVersion = doc?.versions?.[0];
   const activeVersionId = selectedVersionId ?? currentVersion?.id;
@@ -309,7 +321,13 @@ export default function DocumentDetailPage() {
 
       {/* Processing State */}
       {(isProcessing || isFailed) && status && (
-        <ProcessingPanel status={status} isFailed={isFailed} onRefetch={refetchStatus} />
+        <ProcessingPanel
+          status={status}
+          isFailed={isFailed}
+          onRefetch={refetchStatus}
+          onRetry={() => retryMutation.mutate()}
+          isRetrying={retryMutation.isPending}
+        />
       )}
 
       {/* Completed View: Compare Versions Tab or Main Viewer */}
@@ -1526,10 +1544,14 @@ function ProcessingPanel({
   status,
   isFailed,
   onRefetch,
+  onRetry,
+  isRetrying,
 }: {
   status: DocumentProcessingStatus;
   isFailed: boolean;
   onRefetch: () => void;
+  onRetry: () => void;
+  isRetrying?: boolean;
 }) {
   return (
     <div className="glass p-6 space-y-5 rounded-2xl">
@@ -1539,13 +1561,21 @@ function ProcessingPanel({
         </h2>
         {isFailed && (
           <button
-            onClick={onRefetch}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-white/10 text-white/60 hover:text-white transition-colors"
+            onClick={onRetry}
+            disabled={isRetrying}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-white/10 text-white/60 hover:text-white transition-colors disabled:opacity-50"
           >
-            <RefreshCw className="w-3.5 h-3.5" /> Retry
+            <RefreshCw className={cn('w-3.5 h-3.5', isRetrying && 'animate-spin')} />{' '}
+            {isRetrying ? 'Retrying...' : 'Retry'}
           </button>
         )}
       </div>
+
+      {isFailed && status.error?.message && (
+        <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-xs text-red-300">
+          {status.error.message}
+        </div>
+      )}
 
       <div>
         <div className="flex justify-between text-sm mb-2">
