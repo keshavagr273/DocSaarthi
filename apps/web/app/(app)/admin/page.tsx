@@ -67,7 +67,7 @@ export default function AdminPortalPage() {
   // Admin Stats
   const { data: statsData, isLoading: statsLoading, refetch: refetchStats } = useQuery({
     queryKey: ['admin', 'stats'],
-    queryFn: () => adminApi.getStats().then((r) => r.data),
+    queryFn: () => adminApi.getStats().then((r) => r.data.data),
     enabled: isAuthorized,
     refetchInterval: 10000,
   });
@@ -75,14 +75,14 @@ export default function AdminPortalPage() {
   // Admin Users List
   const { data: usersData, isLoading: usersLoading, refetch: refetchUsers } = useQuery({
     queryKey: ['admin', 'users', userSearch],
-    queryFn: () => adminApi.getUsers({ search: userSearch, limit: 50 }).then((r) => r.data),
+    queryFn: () => adminApi.getUsers({ search: userSearch, limit: 50 }).then((r) => r.data.data),
     enabled: isAuthorized,
   });
 
   // Admin Queue Details
   const { data: queueData, isLoading: queueLoading, refetch: refetchQueue } = useQuery({
     queryKey: ['admin', 'queue'],
-    queryFn: () => adminApi.getQueue().then((r) => r.data),
+    queryFn: () => adminApi.getQueue().then((r) => r.data.data),
     enabled: isAuthorized && activeTab === 'queue',
     refetchInterval: 5000,
   });
@@ -97,14 +97,14 @@ export default function AdminPortalPage() {
           status: docStatusFilter,
           limit: 50,
         })
-        .then((r) => r.data),
+        .then((r) => r.data.data),
     enabled: isAuthorized && activeTab === 'documents',
   });
 
   // Selected User Submissions Query
   const { data: userSubmissions, isLoading: userSubmissionsLoading } = useQuery({
     queryKey: ['admin', 'user-documents', selectedUser?.id],
-    queryFn: () => adminApi.getUserDocuments(selectedUser!.id).then((r) => r.data),
+    queryFn: () => adminApi.getUserDocuments(selectedUser!.id).then((r) => r.data.data),
     enabled: isAuthorized && !!selectedUser,
   });
 
@@ -114,7 +114,7 @@ export default function AdminPortalPage() {
       adminApi.toggleUserStatus(userId, isActive),
     onSuccess: (res) => {
       toast.success(
-        res.data.isActive ? 'User account activated' : 'User account disabled',
+        res.data.data.isActive ? 'User account activated' : 'User account disabled',
       );
       void queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
     },
@@ -127,7 +127,7 @@ export default function AdminPortalPage() {
   const retryFailedMutation = useMutation({
     mutationFn: () => adminApi.retryFailedQueue(),
     onSuccess: (res) => {
-      toast.success(res.data.message || 'Retry jobs enqueued');
+      toast.success(res.data.data.message || 'Retry jobs enqueued');
       void refetchStats();
       void refetchQueue();
       void refetchUsers();
@@ -218,7 +218,7 @@ export default function AdminPortalPage() {
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-3xl font-bold text-white tracking-tight font-mono">
-              {statsLoading ? '...' : statsData?.users.total ?? 0}
+              {statsLoading ? '...' : statsData?.users?.total ?? 0}
             </span>
             <span className="text-[11px] text-emerald-400 font-medium">Registered</span>
           </div>
@@ -233,10 +233,10 @@ export default function AdminPortalPage() {
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-3xl font-bold text-white tracking-tight font-mono">
-              {statsLoading ? '...' : statsData?.documents.total ?? 0}
+              {statsLoading ? '...' : statsData?.documents?.total ?? 0}
             </span>
             <span className="text-[11px] text-white/40 font-mono">
-              ({formatFileSize(statsData?.documents.totalBytes ?? 0)})
+              ({formatFileSize(statsData?.documents?.totalBytes ?? 0)})
             </span>
           </div>
           <p className="text-[11px] text-white/40 mt-1">Uploaded across all accounts</p>
@@ -250,16 +250,16 @@ export default function AdminPortalPage() {
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-3xl font-bold text-white tracking-tight font-mono">
-              {statsLoading ? '...' : `${statsData?.documents.successRate ?? 100}%`}
+              {statsLoading ? '...' : `${statsData?.documents?.successRate ?? 100}%`}
             </span>
             <span className="text-[11px] text-emerald-400">
-              {statsData?.documents.completed ?? 0} Done
+              {statsData?.documents?.completed ?? 0} Done
             </span>
           </div>
           <div className="w-full bg-white/[0.06] h-1.5 rounded-full mt-2 overflow-hidden">
             <div
               className="bg-emerald-400 h-full rounded-full transition-all duration-700"
-              style={{ width: `${statsData?.documents.successRate ?? 100}%` }}
+              style={{ width: `${statsData?.documents?.successRate ?? 100}%` }}
             />
           </div>
         </div>
@@ -272,22 +272,22 @@ export default function AdminPortalPage() {
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-3xl font-bold text-white tracking-tight font-mono">
-              {statsLoading ? '...' : statsData?.queue.backlog ?? 0}
+              {statsLoading ? '...' : statsData?.queue?.backlog ?? 0}
             </span>
             <span className="text-[11px] text-amber-400 font-medium">
-              {statsData?.queue.active ?? 0} active / {statsData?.queue.waiting ?? 0} waiting
+              {statsData?.queue?.active ?? 0} active / {statsData?.queue?.waiting ?? 0} waiting
             </span>
           </div>
           <div className="flex items-center gap-2 mt-1">
             <span
               className={cn(
                 'text-[10px] px-2 py-0.5 rounded-full font-mono font-semibold',
-                (statsData?.queue.failed ?? 0) > 0
+                (statsData?.queue?.failed ?? 0) > 0
                   ? 'bg-red-500/20 text-red-300'
                   : 'bg-emerald-500/20 text-emerald-300',
               )}
             >
-              {statsData?.queue.failed ?? 0} Failed
+              {statsData?.queue?.failed ?? 0} Failed
             </span>
             <span className="text-[10px] text-white/40">Bull + Redis engine</span>
           </div>
@@ -313,7 +313,7 @@ export default function AdminPortalPage() {
               activeTab === 'users' ? 'bg-black/10 text-black' : 'bg-white/10 text-white/60',
             )}
           >
-            {usersData?.pagination.total ?? 0}
+            {usersData?.pagination?.total ?? 0}
           </span>
         </button>
 
@@ -328,9 +328,9 @@ export default function AdminPortalPage() {
         >
           <Cpu className="w-3.5 h-3.5" />
           Queue & Processing Engine
-          {(statsData?.queue.backlog ?? 0) > 0 && (
+          {(statsData?.queue?.backlog ?? 0) > 0 && (
             <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-amber-500/20 text-amber-300">
-              {statsData?.queue.backlog}
+              {statsData?.queue?.backlog}
             </span>
           )}
         </button>

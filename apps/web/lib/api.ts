@@ -722,18 +722,18 @@ export interface AdminQueueDetails {
 }
 
 export const adminApi = {
-  getStats: () => api.get<AdminOverviewStats>('/admin/stats'),
+  getStats: () => api.get<{ data: AdminOverviewStats }>('/admin/stats'),
   getUsers: (params?: { search?: string; page?: number; limit?: number }) =>
-    api.get<AdminUsersResponse>('/admin/users', { params }),
+    api.get<{ data: AdminUsersResponse }>('/admin/users', { params }),
   getUserDocuments: (userId: string) =>
-    api.get<AdminUserDetailResponse>(`/admin/users/${userId}/documents`),
+    api.get<{ data: AdminUserDetailResponse }>(`/admin/users/${userId}/documents`),
   toggleUserStatus: (userId: string, isActive: boolean) =>
-    api.patch<{ id: string; email: string; isActive: boolean }>(`/admin/users/${userId}/status`, { isActive }),
+    api.patch<{ data: { id: string; email: string; isActive: boolean } }>(`/admin/users/${userId}/status`, { isActive }),
   getDocuments: (params?: { status?: string; search?: string; page?: number; limit?: number }) =>
-    api.get<AdminDocumentsResponse>('/admin/documents', { params }),
-  getQueue: () => api.get<AdminQueueDetails>('/admin/queue'),
+    api.get<{ data: AdminDocumentsResponse }>('/admin/documents', { params }),
+  getQueue: () => api.get<{ data: AdminQueueDetails }>('/admin/queue'),
   retryFailedQueue: () =>
-    api.post<{ totalFound: number; retriedCount: number; errors: Array<{ id: string; error: string }>; message: string }>(
+    api.post<{ data: { totalFound: number; retriedCount: number; errors: Array<{ id: string; error: string }>; message: string } }>(
       '/admin/queue/retry-failed',
     ),
 };
