@@ -141,6 +141,33 @@ export class StorageService implements OnModuleInit {
   }
 
   /**
+   * Download an object as a Buffer (used by pipeline processor stages).
+   */
+  async downloadBuffer(storageKey: string): Promise<Buffer> {
+    const command = new GetObjectCommand({ Bucket: this.bucket, Key: storageKey });
+    const response = await this.client.send(command);
+
+    if (!response.Body) {
+      throw new Error(`Empty response body for key: ${storageKey}`);
+    }
+
+    const chunks: Uint8Array[] = [];
+    const stream = response.Body as AsyncIterable<Uint8Array>;
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * Get object metadata without downloading the body (alias for objectExists).
+   * Used by pipeline processor stages.
+   */
+  async headObject(storageKey: string): Promise<HeadObjectCommandOutput | null> {
+    return this.objectExists(storageKey);
+  }
+
+  /**
    * Delete an object from storage.
    */
   async deleteObject(storageKey: string): Promise<void> {

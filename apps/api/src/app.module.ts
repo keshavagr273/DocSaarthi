@@ -15,6 +15,7 @@ import { SearchModule } from './modules/search/search.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { ProcessorModule } from './modules/processor/processor.module';
 import { RateLimitGuard } from './common/guards/rate-limit.guard';
 import { getBullRedisConfig } from '@docsaarthi/shared';
 import { envSchema } from './config/env.schema';
@@ -69,6 +70,7 @@ import { envSchema } from './config/env.schema';
     SettingsModule,
     HealthModule,
     AdminModule,
+    ProcessorModule,
   ],
   providers: [
     {
