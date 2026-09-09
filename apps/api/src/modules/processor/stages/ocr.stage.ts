@@ -330,7 +330,7 @@ export class OcrStage extends BaseStage {
 
     try {
       const worker = await this.getTesseractWorker();
-      ret = await worker.recognize(imageBuffer);
+      ret = await worker.recognize(imageBuffer, {}, { blocks: true });
     } catch (err) {
       this.logger.warn(
         `Tesseract recognize attempt 1 failed (${String(err)}), resetting worker and retrying with eng...`,
@@ -345,38 +345,61 @@ export class OcrStage extends BaseStage {
       this.tesseractWorker = null;
       const { createWorker } = await import('tesseract.js');
       this.tesseractWorker = await createWorker('eng');
-      ret = await this.tesseractWorker.recognize(imageBuffer);
+      ret = await this.tesseractWorker.recognize(imageBuffer, {}, { blocks: true });
     }
 
     const blocks: OcrBlock[] = [];
     let order = 0;
 
-    if (ret.data && Array.isArray(ret.data.lines)) {
-      for (const line of ret.data.lines) {
-        const text = (line.text || '').trim();
-        if (text) {
-          const bbox: [number, number, number, number] = line.bbox
-            ? [
-                Math.round(line.bbox.x0),
-                Math.round(line.bbox.y0),
-                Math.round(line.bbox.x1),
-                Math.round(line.bbox.y1),
-              ]
-            : [0, 0, width, height];
+    if (ret.data && Array.isArray(ret.data.blocks)) {
+      for (const b of ret.data.blocks) {
+        if (Array.isArray(b.paragraphs)) {
+          for (const p of b.paragraphs) {
+            if (Array.isArray(p.lines)) {
+              for (const l of p.lines) {
+                const text = (l.text || '').trim();
+                if (text) {
+                  const bbox: [number, number, number, number] = l.bbox
+                    ? [
+                        Math.round(l.bbox.x0),
+                        Math.round(l.bbox.y0),
+                        Math.round(l.bbox.x1),
+                        Math.round(l.bbox.y1),
+                      ]
+                    : [0, 0, width, height];
 
-          blocks.push({
-            id: `tess-b-${pageNumber}-${order++}`,
-            text,
-            bbox,
-            confidence: Math.max(0.1, Math.min(1.0, (line.confidence || 75) / 100)),
-            readingOrder: order,
-            blockType: 'text',
-          });
+                  blocks.push({
+                    id: `tess-b-${pageNumber}-${order++}`,
+                    text,
+                    bbox,
+                    confidence: Math.max(0.1, Math.min(1.0, (l.confidence || 75) / 100)),
+                    readingOrder: order,
+                    blockType: 'text',
+                  });
+                }
+              }
+            }
+          }
         }
       }
     }
 
     const rawText = (ret.data?.text || '').trim();
+
+    // Fallback: if block hierarchy was empty but rawText exists, generate line-level blocks
+    if (blocks.length === 0 && rawText.length > 0) {
+      const lines = rawText.split('\n').map((s: string) => s.trim()).filter((s: string) => s.length > 0);
+      lines.forEach((lineText: string, idx: number) => {
+        blocks.push({
+          id: `tess-b-${pageNumber}-${idx}`,
+          text: lineText,
+          bbox: [0, 0, width, height],
+          confidence: Math.max(0.1, Math.min(1.0, (ret.data?.confidence || 80) / 100)),
+          readingOrder: idx,
+          blockType: 'text',
+        });
+      });
+    }
     const pageConfidence = ret.data?.confidence
       ? Math.max(0.1, Math.min(1.0, ret.data.confidence / 100))
       : (rawText.length > 0 ? 0.85 : 0);

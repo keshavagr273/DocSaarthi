@@ -402,13 +402,18 @@ Respond with valid JSON only:
       }>(content, {});
 
       const fields: ExtractedField[] = (parsed.fields ?? [])
-        .filter((f) => f.fieldName && f.rawValue && f.rawValue.trim().length > 0)
         .map((f) => ({
-          fieldName: f.fieldName!,
+          ...f,
+          fieldName: String(f.fieldName ?? '').trim(),
+          rawValue: f.rawValue !== undefined && f.rawValue !== null ? String(f.rawValue).trim() : '',
+        }))
+        .filter((f) => f.fieldName.length > 0 && f.rawValue.length > 0)
+        .map((f) => ({
+          fieldName: f.fieldName,
           fieldType: (f.fieldType as ExtractedField['fieldType']) ?? 'TEXT',
-          rawValue: f.rawValue!.trim(),
-          confidence: typeof f.confidence === 'number' ? Math.min(1, Math.max(0, f.confidence)) : 0.5,
-          sourcePage: f.sourcePage ?? 1,
+          rawValue: f.rawValue,
+          confidence: typeof f.confidence === 'number' ? Math.min(1, Math.max(0, f.confidence)) : 0.85,
+          sourcePage: typeof f.sourcePage === 'number' ? f.sourcePage : 1,
           extractionMethod: 'llm',
         }));
 

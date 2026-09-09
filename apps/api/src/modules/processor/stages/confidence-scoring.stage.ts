@@ -110,7 +110,7 @@ export class ConfidenceScoringStage extends BaseStage {
   ): number | null {
     if (!rawValue || blocks.length === 0) return null;
 
-    const normalizedValue = rawValue.trim().toLowerCase();
+    const normalizedValue = String(rawValue ?? '').trim().toLowerCase();
     let best: number | null = null;
 
     for (const block of blocks) {

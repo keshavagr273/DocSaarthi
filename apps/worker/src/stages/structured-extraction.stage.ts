@@ -57,13 +57,14 @@ export class StructuredExtractionStage extends BaseStage {
     }[] = [];
 
     for (const field of fields) {
-      if (!field.rawValue.trim()) continue; // skip empty extractions
+      const rawStr = String(field.rawValue ?? '').trim();
+      if (!rawStr) continue; // skip empty extractions
 
       fieldCreateData.push({
         documentId: ctx.documentId,
         fieldName: field.fieldName,
         fieldType: field.fieldType as never,
-        rawValue: field.rawValue,
+        rawValue: rawStr,
         confidence: field.confidence,
         confidenceLevel: this.toConfidenceLevel(field.confidence),
         sourcePage: field.sourcePage ?? null,
