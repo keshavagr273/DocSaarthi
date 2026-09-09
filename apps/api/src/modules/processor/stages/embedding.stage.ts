@@ -6,8 +6,7 @@ import type { Job } from 'bull';
 import { DatabaseService, ProcessingStage } from '@docsaarthi/database';
 import { BaseStage } from './base.stage';
 import { LlmService } from '../services/llm.service';
-import type { PipelineContext } from './pipeline-context';
-import type { DocumentProcessingJobData } from '../document.processor';
+import type { PipelineContext, DocumentProcessingJobData } from './pipeline-context';
 
 const EMBEDDING_BATCH_SIZE = 50; // OpenAI allows up to 2048 inputs, but keep batches small
 const EMBEDDING_CACHE_TTL_SECONDS = 86400; // 24 hours
@@ -126,6 +125,9 @@ export class EmbeddingStage extends BaseStage {
 
         // Store in DB via raw SQL (pgvector requires this)
         const vectorStr = `[${Array.from(embedding).join(',')}]`;
+        const modelName = this.llm.getEmbeddingModel();
+        const dimension = this.llm.getEmbeddingDimension();
+
         await this.db.$executeRaw`
           INSERT INTO document_embeddings (id, "chunkId", "documentId", "versionId", model, dimension, embedding, "createdAt")
           VALUES (
@@ -133,8 +135,8 @@ export class EmbeddingStage extends BaseStage {
             ${chunkId},
             ${ctx.documentId},
             ${ctx.versionId},
-            ${'text-embedding-3-small'},
-            ${1536},
+            ${modelName},
+            ${dimension},
             ${vectorStr}::vector,
             NOW()
           )
@@ -152,9 +154,11 @@ export class EmbeddingStage extends BaseStage {
 
     this.markStageCompleted(ctx.versionId, ctx);
     const batchCount = Math.ceil(chunks.length / EMBEDDING_BATCH_SIZE);
+    const activeModel = this.llm.getEmbeddingModel();
+    const activeDim = this.llm.getEmbeddingDimension();
     this.logger.log(
       `[${ctx.documentId}] Stage 13 DONE — embedded ${allEmbeddings.length} chunks | ` +
-      `batches=${batchCount} | model=text-embedding-3-small | dim=1536 | redisConnected=${!!redis}`,
+      `batches=${batchCount} | model=${activeModel} | dim=${activeDim} | redisConnected=${!!redis}`,
     );
     this.logger.debug(
       `[${ctx.documentId}] Stage 13 DETAILS:\n` +
@@ -162,7 +166,7 @@ export class EmbeddingStage extends BaseStage {
       `  embeddingsStored: ${allEmbeddings.length}\n` +
       `  batchSize       : ${EMBEDDING_BATCH_SIZE}\n` +
       `  batchCount      : ${batchCount}\n` +
-      `  embeddingModel  : text-embedding-3-small (dim 1536)\n` +
+      `  embeddingModel  : ${activeModel} (dim ${activeDim})\n` +
       `  redisCacheActive: ${!!redis}`,
     );
   }

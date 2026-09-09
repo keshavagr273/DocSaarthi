@@ -248,9 +248,14 @@ export class SettingsService {
           }),
         ]);
 
-        const categoryBreakdown = categoriesAgg.map((c: (typeof categoriesAgg)[number]) => ({
-          category: c.category ?? 'UNKNOWN',
-          count: c._count,
+        const categoryMap = new Map<string, number>();
+        for (const c of categoriesAgg) {
+          const cat = c.category ?? 'UNKNOWN';
+          categoryMap.set(cat, (categoryMap.get(cat) ?? 0) + c._count);
+        }
+        const categoryBreakdown = Array.from(categoryMap.entries()).map(([category, count]) => ({
+          category,
+          count,
         }));
 
         return {

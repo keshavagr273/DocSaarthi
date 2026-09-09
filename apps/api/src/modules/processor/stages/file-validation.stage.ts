@@ -4,7 +4,7 @@ import { DatabaseService, ProcessingStage } from '@docsaarthi/database';
 import { BaseStage } from './base.stage';
 import { StorageService } from '../../storage/storage.service';
 import type { PipelineContext } from './pipeline-context';
-import type { DocumentProcessingJobData } from '../document.processor';
+import type { DocumentProcessingJobData } from './pipeline-context';
 
 // We use a dynamic import for pdfjs-dist because it ships as ESM in v4+
 // and we need to handle it carefully at runtime

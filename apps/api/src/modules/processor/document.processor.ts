@@ -9,7 +9,7 @@ import { Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { Job } from 'bull';
 import { DatabaseService, ProcessingStatus, ProcessingStage, DocumentStatus } from '@docsaarthi/database';
 import { QUEUES, JOBS } from '@docsaarthi/shared';
-import { createPipelineContext, type PipelineContext, type OcrBlock } from './stages/pipeline-context';
+import { createPipelineContext, type PipelineContext, type OcrBlock, type DocumentProcessingJobData } from './stages/pipeline-context';
 
 // ── Stage imports ───────────────────────────────────────────────────
 import { FileValidationStage } from './stages/file-validation.stage';
@@ -27,15 +27,7 @@ import { ChunkingStage } from './stages/chunking.stage';
 import { EmbeddingStage } from './stages/embedding.stage';
 import { IndexingStage } from './stages/indexing.stage';
 import type { BaseStage } from './stages/base.stage';
-
-export interface DocumentProcessingJobData {
-  documentId: string;
-  versionId: string;
-  userId: string;
-  storageKey: string;
-  mimeType: string;
-  requestId?: string;
-}
+export type { DocumentProcessingJobData };
 
 /**
  * DocumentProcessor — the main BullMQ processor for the document pipeline.

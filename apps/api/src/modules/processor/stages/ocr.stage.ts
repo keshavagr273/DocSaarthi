@@ -6,7 +6,7 @@ import { OcrClientService } from '../services/ocr-client.service';
 import { LlmService } from '../services/llm.service';
 import { StorageService } from '../../storage/storage.service';
 import type { PipelineContext, OcrPageResult, OcrBlock } from './pipeline-context';
-import type { DocumentProcessingJobData } from '../document.processor';
+import type { DocumentProcessingJobData } from './pipeline-context';
 
 /**
  * Stage 5: OCR with VLM Fallback & Selective Block Refinement

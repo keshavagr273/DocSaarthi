@@ -3,7 +3,7 @@ import type { Job } from 'bull';
 import { DatabaseService, ProcessingStage } from '@docsaarthi/database';
 import { BaseStage } from './base.stage';
 import type { PipelineContext, DocumentChunkData } from './pipeline-context';
-import type { DocumentProcessingJobData } from '../document.processor';
+import type { DocumentProcessingJobData } from './pipeline-context';
 
 const TARGET_CHUNK_MIN_TOKENS = 300;
 const TARGET_CHUNK_MAX_TOKENS = 600;

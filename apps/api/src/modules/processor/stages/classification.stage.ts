@@ -4,7 +4,7 @@ import { DatabaseService, ProcessingStage } from '@docsaarthi/database';
 import { BaseStage } from './base.stage';
 import { LlmService } from '../services/llm.service';
 import type { PipelineContext } from './pipeline-context';
-import type { DocumentProcessingJobData } from '../document.processor';
+import type { DocumentProcessingJobData } from './pipeline-context';
 
 /**
  * Stage 7: DOCUMENT_CLASSIFICATION

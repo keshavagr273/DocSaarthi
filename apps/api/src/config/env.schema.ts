@@ -35,13 +35,19 @@ export const envSchema = z.object({
   // CORS
   CORS_ORIGIN: z.string().default('http://localhost:3000'),
 
-  // AI
+  // AI — LLM (Groq via OpenAI-compat endpoint)
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
-  DEFAULT_LLM_PROVIDER: z.string().default('openai'),
+  DEFAULT_LLM_PROVIDER: z.string().default('groq'),
   DEFAULT_LLM_MODEL: z.string().default('groq/compound-mini'),
   DEFAULT_VISION_MODEL: z.string().default('groq/compound-mini'),
-  DEFAULT_EMBEDDING_MODEL: z.string().default('text-embedding-3-small'),
+
+  // AI — Embeddings (Cohere embed-v4.0 or OpenAI text-embedding-3-small)
+  COHERE_API_KEY: z.string().optional(),
+  EMBEDDING_PROVIDER: z.string().default('cohere'),
+  EMBEDDING_API_KEY: z.string().optional(),
+  EMBEDDING_BASE_URL: z.string().optional(),
+  DEFAULT_EMBEDDING_MODEL: z.string().default('embed-v4.0'),
   EMBEDDING_DIMENSION: z.coerce.number().default(1536),
 
   // OCR

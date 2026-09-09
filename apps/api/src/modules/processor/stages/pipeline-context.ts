@@ -1,5 +1,13 @@
 import type { Job } from 'bull';
-import type { DocumentProcessingJobData } from '../document.processor';
+
+export interface DocumentProcessingJobData {
+  documentId: string;
+  versionId: string;
+  userId: string;
+  storageKey: string;
+  mimeType: string;
+  requestId?: string;
+}
 
 /**
  * OcrBlock — a single text block from PaddleOCR or fallback.

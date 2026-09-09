@@ -24,9 +24,17 @@ export class StorageService implements OnModuleInit {
   private client!: S3Client;
   private bucket!: string;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(private readonly config: ConfigService) {
+    this.initClient();
+  }
 
   onModuleInit(): void {
+    this.initClient();
+  }
+
+  private initClient(): void {
+    if (this.client) return;
+
     let endpoint = (this.config.get<string>('MINIO_ENDPOINT', 'localhost') || 'localhost').trim();
     // Strip leading https:// or http:// if user included it in environment variable
     endpoint = endpoint.replace(/^https?:\/\//, '').replace(/\/+$/, '');

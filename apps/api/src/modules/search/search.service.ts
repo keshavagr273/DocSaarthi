@@ -28,14 +28,24 @@ export interface SearchResponse {
 export class SearchService {
   private readonly logger = new Logger(SearchService.name);
   private readonly openai: OpenAI;
+  private readonly cohereApiKey?: string;
+  private readonly embeddingProvider: string;
   private readonly embeddingModel: string;
 
   constructor(private readonly db: DatabaseService) {
     this.openai = new OpenAI({
-      apiKey: process.env['OPENAI_API_KEY'] ?? '',
-      baseURL: process.env['OPENAI_BASE_URL'] || undefined,
+      apiKey: process.env['EMBEDDING_API_KEY'] || process.env['OPENAI_API_KEY'] || '',
+      baseURL: process.env['EMBEDDING_BASE_URL'] || process.env['OPENAI_BASE_URL'] || undefined,
     });
-    this.embeddingModel = process.env['DEFAULT_EMBEDDING_MODEL'] ?? 'text-embedding-3-small';
+    this.cohereApiKey =
+      process.env['COHERE_API_KEY'] ||
+      (process.env['EMBEDDING_PROVIDER'] === 'cohere' ? process.env['EMBEDDING_API_KEY'] : undefined);
+    this.embeddingProvider = (
+      process.env['EMBEDDING_PROVIDER'] || (this.cohereApiKey ? 'cohere' : 'openai')
+    ).toLowerCase();
+    this.embeddingModel =
+      process.env['DEFAULT_EMBEDDING_MODEL'] ??
+      (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');
   }
 
   // ── Unified Search Entry Point ────────────────────────────────────
@@ -281,10 +291,49 @@ export class SearchService {
   // ── Helper: Query Embedding ───────────────────────────────────────
 
   async generateQueryEmbedding(query: string): Promise<Float32Array | null> {
+    const cleanQuery = query.trim() || ' ';
+
+    // 1. Prefer Cohere if configured
+    if (this.embeddingProvider === 'cohere' && this.cohereApiKey) {
+      try {
+        const response = await fetch('https://api.cohere.com/v2/embed', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.cohereApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: this.embeddingModel,
+            texts: [cleanQuery],
+            input_type: 'search_query',
+            embedding_types: ['float'],
+            truncate: 'END',
+          }),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Cohere API error ${response.status}: ${errText}`);
+        }
+
+        const data = (await response.json()) as {
+          embeddings?: { float?: number[][] };
+        };
+        const embedding = data.embeddings?.float?.[0];
+        return embedding ? new Float32Array(embedding) : null;
+      } catch (err) {
+        this.logger.warn(
+          `Cohere query embedding failed (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
+        );
+        return this.generateFallbackEmbedding(cleanQuery);
+      }
+    }
+
+    // 2. OpenAI embedding fallback
     try {
       const response = await this.openai.embeddings.create({
         model: this.embeddingModel,
-        input: query,
+        input: cleanQuery,
         encoding_format: 'float',
       });
       const embedding = response.data[0]?.embedding;
@@ -293,7 +342,7 @@ export class SearchService {
       this.logger.warn(
         `Remote query embedding unavailable (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
       );
-      return this.generateFallbackEmbedding(query);
+      return this.generateFallbackEmbedding(cleanQuery);
     }
   }
 

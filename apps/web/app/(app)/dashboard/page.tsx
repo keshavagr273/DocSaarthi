@@ -229,8 +229,8 @@ export default function DashboardPage() {
               <div className="py-6 text-center text-xs text-white/30">No categorized documents</div>
             ) : (
               <div className="space-y-2">
-                {categories.map((cat) => (
-                  <div key={cat.category} className="flex items-center justify-between text-xs py-1">
+                {categories.map((cat, idx) => (
+                  <div key={`${cat.category}-${idx}`} className="flex items-center justify-between text-xs py-1">
                     <span className="text-white/70 capitalize text-xs">
                       {cat.category.replace(/_/g, ' ').toLowerCase()}
                     </span>

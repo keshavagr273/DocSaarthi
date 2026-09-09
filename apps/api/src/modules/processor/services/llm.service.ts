@@ -22,24 +22,71 @@ export interface VisionOcrBlockJson {
 }
 
 /**
- * LlmService — wrapper around OpenAI for classification, extraction, vision OCR, and embeddings.
+ * LlmService — wrapper around OpenAI SDK and Cohere for LLM, vision, and embeddings.
+ *
+ * Architecture:
+ *  - `client`:          LLM + Vision  → Gemini via OpenAI-compat endpoint
+ *  - `embedding`:       Cohere Embed v4.0 (1536-dim vectors, matches pgvector column vector(1536))
+ *                       or OpenAI fallback if configured.
  */
 @Injectable()
 export class LlmService {
   private readonly logger = new Logger(LlmService.name);
+
+  /** Primary client — used for chat completions and vision (points at Gemini). */
   private readonly client: OpenAI;
+
+  /**
+   * Optional OpenAI embedding client if EMBEDDING_PROVIDER=openai.
+   */
+  private readonly embeddingClient: OpenAI | null;
+
+  private readonly cohereApiKey?: string;
+  private readonly embeddingProvider: string;
   private readonly chatModel: string;
   private readonly visionModel: string;
   private readonly embeddingModel: string;
+  private readonly embeddingDimension: number;
 
   constructor() {
+    // ── LLM / Vision client (Gemini via OpenAI-compat endpoint) ────
     this.client = new OpenAI({
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
       baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
+
+    // ── Embeddings configuration (Cohere or OpenAI) ────────────────
+    this.cohereApiKey =
+      process.env['COHERE_API_KEY'] ||
+      (process.env['EMBEDDING_PROVIDER'] === 'cohere' ? process.env['EMBEDDING_API_KEY'] : undefined);
+
+    this.embeddingProvider = (
+      process.env['EMBEDDING_PROVIDER'] || (this.cohereApiKey ? 'cohere' : 'openai')
+    ).toLowerCase();
+
+    const embeddingKey = process.env['EMBEDDING_API_KEY'];
+    this.embeddingClient =
+      this.embeddingProvider === 'openai' && embeddingKey
+        ? new OpenAI({
+            apiKey: embeddingKey,
+            baseURL: process.env['EMBEDDING_BASE_URL'] || undefined,
+          })
+        : null;
+
     this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
     this.visionModel = process.env['DEFAULT_VISION_MODEL'] ?? 'groq/compound-mini';
-    this.embeddingModel = process.env['DEFAULT_EMBEDDING_MODEL'] ?? 'text-embedding-3-small';
+    this.embeddingModel =
+      process.env['DEFAULT_EMBEDDING_MODEL'] ??
+      (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');
+    this.embeddingDimension = Number(process.env['EMBEDDING_DIMENSION'] ?? 1536);
+  }
+
+  getEmbeddingModel(): string {
+    return this.embeddingModel;
+  }
+
+  getEmbeddingDimension(): number {
+    return this.embeddingDimension;
   }
 
   // ── Classification ────────────────────────────────────────────────
@@ -68,16 +115,16 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
         temperature: 0,
-        max_tokens: 350,
+        max_tokens: 1000,
       });
 
       const content = response.choices[0]?.message?.content ?? '{}';
-      const parsed = JSON.parse(content) as {
+      const parsed = this.parseJsonSafe<{
         category?: string;
         confidence?: number;
         reasoning?: string;
         key_indicators?: string[];
-      };
+      }>(content, {});
 
       return {
         category: parsed.category ?? 'UNKNOWN',
@@ -104,6 +151,33 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
     height = 1400,
   ): Promise<OcrPageResult> {
     const startTime = Date.now();
+
+    // Guard: only models that support vision (image_url) content blocks
+    // Groq/compound-mini and other text-only models reject array content → 400
+    const isVisionCapable =
+      this.visionModel.includes('gpt-4') ||
+      this.visionModel.includes('gpt-4o') ||
+      this.visionModel.includes('vision') ||
+      this.visionModel.includes('claude-3') ||
+      this.visionModel.includes('gemini');
+
+    if (!isVisionCapable) {
+      this.logger.warn(
+        `Vision model "${this.visionModel}" does not support image input. Skipping VLM OCR for page ${pageNumber}.`,
+      );
+      return {
+        pageNumber,
+        width,
+        height,
+        blocks: [],
+        rawText: '',
+        pageConfidence: 0,
+        pageLanguage: 'unknown',
+        processingTimeMs: Date.now() - startTime,
+        fallbackUsed: true,
+      };
+    }
+
     const base64Image = imageBuffer.toString('base64');
     const dataUri = `data:image/png;base64,${base64Image}`;
 
@@ -153,11 +227,11 @@ Return JSON in this exact structure:
       });
 
       const content = response.choices[0]?.message?.content ?? '{}';
-      const parsed = JSON.parse(content) as {
+      const parsed = this.parseJsonSafe<{
         containsHandwriting?: boolean;
         language?: string;
         blocks?: VisionOcrBlockJson[];
-      };
+      }>(content, {});
 
       const blocks: OcrBlock[] = (parsed.blocks ?? []).map((b, idx) => ({
         id: `vlm_block_${pageNumber}_${idx}`,
@@ -208,6 +282,18 @@ Return JSON in this exact structure:
     cropBuffer: Buffer,
     originalText: string,
   ): Promise<{ text: string; confidence: number }> {
+    const isVisionCapable =
+      !((process.env['OPENAI_BASE_URL'] || '').includes('groq.com')) &&
+      (this.visionModel.includes('gpt-4') ||
+        this.visionModel.includes('gpt-4o') ||
+        this.visionModel.includes('vision') ||
+        this.visionModel.includes('claude-3') ||
+        this.visionModel.includes('gemini'));
+
+    if (!isVisionCapable) {
+      return { text: originalText, confidence: 0.75 };
+    }
+
     const base64Image = cropBuffer.toString('base64');
     const dataUri = `data:image/png;base64,${base64Image}`;
 
@@ -238,7 +324,7 @@ Return JSON only:
       });
 
       const content = response.choices[0]?.message?.content ?? '{}';
-      const parsed = JSON.parse(content) as { text?: string; confidence?: number };
+      const parsed = this.parseJsonSafe<{ text?: string; confidence?: number }>(content, {});
       return {
         text: parsed.text ?? originalText,
         confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.9,
@@ -292,7 +378,7 @@ Respond with valid JSON only:
     }
   ],
   "extractionNotes": "..."
-}`;
+} `;
 
     try {
       const response = await this.client.chat.completions.create({
@@ -304,7 +390,7 @@ Respond with valid JSON only:
       });
 
       const content = response.choices[0]?.message?.content ?? '{}';
-      const parsed = JSON.parse(content) as {
+      const parsed = this.parseJsonSafe<{
         fields?: Array<{
           fieldName?: string;
           fieldType?: string;
@@ -313,7 +399,7 @@ Respond with valid JSON only:
           sourcePage?: number;
         }>;
         extractionNotes?: string;
-      };
+      }>(content, {});
 
       const fields: ExtractedField[] = (parsed.fields ?? [])
         .filter((f) => f.fieldName && f.rawValue && f.rawValue.trim().length > 0)
@@ -359,11 +445,11 @@ Respond with valid JSON:
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
         temperature: 0,
-        max_tokens: 200,
+        max_tokens: 800,
       });
 
       const content = response.choices[0]?.message?.content ?? '{}';
-      const parsed = JSON.parse(content) as { summary?: string };
+      const parsed = this.parseJsonSafe<{ summary?: string }>(content, {});
       return parsed.summary ?? 'Document fields updated between versions.';
     } catch {
       return 'Document fields and content updated in the new version.';
@@ -375,23 +461,96 @@ Respond with valid JSON:
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
 
-    try {
-      const response = await this.client.embeddings.create({
-        model: this.embeddingModel,
-        input: texts,
-        encoding_format: 'float',
+    // 1. Prefer Cohere if configured (embed-v4.0 natively outputs 1536-dim embeddings)
+    if (this.embeddingProvider === 'cohere' && this.cohereApiKey) {
+      try {
+        return await this.embedWithCohere(texts, 'search_document');
+      } catch (err) {
+        this.logger.warn(
+          `Cohere embedding endpoint failed (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
+        );
+        return texts.map((t) => this.generateFallbackEmbedding(t, this.embeddingDimension));
+      }
+    }
+
+    // 2. OpenAI embedding client fallback
+    if (this.embeddingClient) {
+      try {
+        const response = await this.embeddingClient.embeddings.create({
+          model: this.embeddingModel,
+          input: texts,
+          encoding_format: 'float',
+        });
+
+        return response.data
+          .sort((a, b) => a.index - b.index)
+          .map((item) => new Float32Array(item.embedding));
+      } catch (err) {
+        this.logger.warn(
+          `OpenAI embedding endpoint unavailable (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
+        );
+        return texts.map((t) => this.generateFallbackEmbedding(t, this.embeddingDimension));
+      }
+    }
+
+    // 3. Deterministic local fallback
+    this.logger.warn(
+      'No remote embedding key configured. Using deterministic 1536-dim semantic feature vector fallback.',
+    );
+    return texts.map((t) => this.generateFallbackEmbedding(t, this.embeddingDimension));
+  }
+
+  /**
+   * Batch embeddings via Cohere Embed API v2.
+   * Chunks into max 96 texts per request (Cohere limit) and sets input_type + truncate: 'END'.
+   */
+  private async embedWithCohere(
+    texts: string[],
+    inputType: 'search_document' | 'search_query',
+  ): Promise<Float32Array[]> {
+    const BATCH_SIZE = 96;
+    const results: Float32Array[] = [];
+
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const batch = texts.slice(i, i + BATCH_SIZE).map((t) => t.trim() || ' ');
+
+      const response = await fetch('https://api.cohere.com/v2/embed', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.cohereApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: this.embeddingModel,
+          texts: batch,
+          input_type: inputType,
+          embedding_types: ['float'],
+          truncate: 'END',
+        }),
       });
 
-      return response.data
-        .sort((a, b) => a.index - b.index)
-        .map((item) => new Float32Array(item.embedding));
-    } catch (err) {
-      this.logger.warn(
-        `Remote embedding endpoint unavailable (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
-      );
-      return texts.map((t) => this.generateFallbackEmbedding(t));
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Cohere API error ${response.status}: ${errorText}`);
+      }
+
+      const data = (await response.json()) as {
+        embeddings?: { float?: number[][] };
+      };
+
+      const floatEmbeddings = data.embeddings?.float;
+      if (!floatEmbeddings || !Array.isArray(floatEmbeddings)) {
+        throw new Error('Cohere API response missing embeddings.float array');
+      }
+
+      for (const vec of floatEmbeddings) {
+        results.push(new Float32Array(vec));
+      }
     }
+
+    return results;
   }
+
 
   private generateFallbackEmbedding(text: string, dim = 1536): Float32Array {
     const vec = new Float32Array(dim);
@@ -541,5 +700,17 @@ Respond with valid JSON:
     };
 
     return schemas[category] ?? schemas['UNKNOWN']!;
+  }
+
+  private parseJsonSafe<T>(rawContent: string, fallback: T): T {
+    try {
+      let cleaned = rawContent.trim();
+      if (cleaned.startsWith('```')) {
+        cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      }
+      return JSON.parse(cleaned) as T;
+    } catch {
+      return fallback;
+    }
   }
 }

@@ -69,7 +69,7 @@ export class HealthController {
         llmProvider: {
           status: hasKey ? 'up' : 'down',
           provider: process.env['DEFAULT_LLM_PROVIDER'] ?? 'groq',
-          model: process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-20b',
+          model: process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini',
         },
         queues: {
           status: 'up',

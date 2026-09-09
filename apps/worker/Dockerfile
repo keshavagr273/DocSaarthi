@@ -31,4 +31,4 @@ COPY --from=installer --chown=worker:nodejs /app/apps/worker/dist ./apps/worker/
 COPY --from=installer --chown=worker:nodejs /app/node_modules ./node_modules
 COPY --from=installer --chown=worker:nodejs /app/packages ./packages
 
-CMD ["node", "apps/worker/dist/main.js"]
+CMD ["node", "apps/worker/dist/apps/worker/src/main.js"]

@@ -1,8 +1,7 @@
 import { Logger } from '@nestjs/common';
 import type { Job } from 'bull';
 import { DatabaseService, ProcessingStage } from '@docsaarthi/database';
-import type { PipelineContext } from './pipeline-context';
-import type { DocumentProcessingJobData } from '../document.processor';
+import type { PipelineContext, DocumentProcessingJobData } from './pipeline-context';
 
 type HistoryEntry = {
   stage: string;
