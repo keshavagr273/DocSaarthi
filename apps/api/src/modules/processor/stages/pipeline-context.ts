@@ -35,6 +35,7 @@ export interface OcrPageResult {
   pageLanguage: string;
   processingTimeMs: number;
   fallbackUsed: boolean;
+  fallbackProvider?: string;
 }
 
 /**

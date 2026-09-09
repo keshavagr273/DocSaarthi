@@ -170,12 +170,29 @@ export class OcrStage extends BaseStage {
 
             try {
               const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
-              if (vlmResult.blocks.length > 0) {
+              if (vlmResult.blocks.length > 0 && vlmResult.rawText.trim().length > 0) {
                 result = vlmResult;
-              } else {
-                result = paddleResult;
               }
             } catch {
+              // VLM fallback failed or unavailable
+            }
+
+            // If VLM produced no text (or was skipped because LLM is text-only), fall back to built-in Tesseract OCR
+            if (!result || result.blocks.length === 0 || !result.rawText.trim()) {
+              this.logger.log(
+                `[${ctx.documentId}] Running built-in Tesseract OCR for page ${pageNum}...`,
+              );
+              try {
+                const tessResult = await this.runTesseractOcr(buffer, pageNum, width, height);
+                if (tessResult.rawText.trim().length > 0) {
+                  result = tessResult;
+                }
+              } catch (tessErr) {
+                this.logger.warn(`[${ctx.documentId}] Tesseract OCR failed on page ${pageNum}: ${String(tessErr)}`);
+              }
+            }
+
+            if (!result) {
               result = paddleResult;
             }
           } else {
@@ -213,7 +230,7 @@ export class OcrStage extends BaseStage {
         ? (Object.keys(preprocessedBuffers).length === 0 || result.pageConfidence >= 0.98
             ? 'pdf-direct'
             : 'paddle')
-        : 'vlm-fallback';
+        : (result.fallbackProvider || 'vlm-fallback');
       const textSample = result.rawText.replace(/\n/g, ' ').substring(0, 80);
       this.logger.log(
         `[${ctx.documentId}] OCR page ${result.pageNumber}: ` +
@@ -238,9 +255,9 @@ export class OcrStage extends BaseStage {
           blocks: sanitizedBlocks as unknown as object[],
           pageConfidence: result.pageConfidence,
           pageLanguage: result.pageLanguage,
-          ocrProvider: result.fallbackUsed ? 'vlm' : 'paddle',
+          ocrProvider: result.fallbackProvider ?? (result.fallbackUsed ? 'vlm' : 'paddle'),
           fallbackUsed: result.fallbackUsed,
-          fallbackProvider: result.fallbackUsed ? 'openai-vision' : null,
+          fallbackProvider: result.fallbackProvider ?? (result.fallbackUsed ? 'openai-vision' : null),
           processingTimeMs: result.processingTimeMs,
         },
       });
@@ -281,5 +298,103 @@ export class OcrStage extends BaseStage {
   private avgConfidence(results: OcrPageResult[]): number {
     if (results.length === 0) return 0;
     return results.reduce((sum, r) => sum + r.pageConfidence, 0) / results.length;
+  }
+
+  // ── In-Process Tesseract.js OCR Fallback ───────────────────────────
+  // Used on Render / cloud deployments when PaddleOCR sidecar is down and VLM is unavailable.
+  private tesseractWorker: any = null;
+
+  private async getTesseractWorker() {
+    if (!this.tesseractWorker) {
+      const { createWorker } = await import('tesseract.js');
+      try {
+        this.tesseractWorker = await createWorker(['eng', 'hin']);
+      } catch (err) {
+        this.logger.warn(
+          `Failed initializing eng+hin Tesseract worker, falling back to eng: ${String(err)}`,
+        );
+        this.tesseractWorker = await createWorker('eng');
+      }
+    }
+    return this.tesseractWorker;
+  }
+
+  private async runTesseractOcr(
+    imageBuffer: Buffer,
+    pageNumber: number,
+    width: number,
+    height: number,
+  ): Promise<OcrPageResult> {
+    const startTime = Date.now();
+    let ret: any;
+
+    try {
+      const worker = await this.getTesseractWorker();
+      ret = await worker.recognize(imageBuffer);
+    } catch (err) {
+      this.logger.warn(
+        `Tesseract recognize attempt 1 failed (${String(err)}), resetting worker and retrying with eng...`,
+      );
+      try {
+        if (this.tesseractWorker) {
+          await this.tesseractWorker.terminate().catch(() => {});
+        }
+      } catch {
+        // ignore
+      }
+      this.tesseractWorker = null;
+      const { createWorker } = await import('tesseract.js');
+      this.tesseractWorker = await createWorker('eng');
+      ret = await this.tesseractWorker.recognize(imageBuffer);
+    }
+
+    const blocks: OcrBlock[] = [];
+    let order = 0;
+
+    if (ret.data && Array.isArray(ret.data.lines)) {
+      for (const line of ret.data.lines) {
+        const text = (line.text || '').trim();
+        if (text) {
+          const bbox: [number, number, number, number] = line.bbox
+            ? [
+                Math.round(line.bbox.x0),
+                Math.round(line.bbox.y0),
+                Math.round(line.bbox.x1),
+                Math.round(line.bbox.y1),
+              ]
+            : [0, 0, width, height];
+
+          blocks.push({
+            id: `tess-b-${pageNumber}-${order++}`,
+            text,
+            bbox,
+            confidence: Math.max(0.1, Math.min(1.0, (line.confidence || 75) / 100)),
+            readingOrder: order,
+            blockType: 'text',
+          });
+        }
+      }
+    }
+
+    const rawText = (ret.data?.text || '').trim();
+    const pageConfidence = ret.data?.confidence
+      ? Math.max(0.1, Math.min(1.0, ret.data.confidence / 100))
+      : (rawText.length > 0 ? 0.85 : 0);
+
+    const containsHindi = /[\u0900-\u097F]/.test(rawText);
+    const pageLanguage = containsHindi ? 'hi' : 'en';
+
+    return {
+      pageNumber,
+      width,
+      height,
+      blocks,
+      rawText,
+      pageConfidence,
+      pageLanguage,
+      processingTimeMs: Date.now() - startTime,
+      fallbackUsed: true,
+      fallbackProvider: 'tesseract',
+    };
   }
 }
