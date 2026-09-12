@@ -33,8 +33,11 @@ export interface VisionOcrBlockJson {
 export class LlmService {
   private readonly logger = new Logger(LlmService.name);
 
-  /** Primary client — used for chat completions and vision (points at Gemini). */
+  /** Primary client — used for chat completions (points at Groq). */
   private readonly client: OpenAI;
+
+  /** Vision client — used for image OCR and block refinement (points at Gemini). */
+  private readonly visionClient: OpenAI;
 
   /**
    * Optional OpenAI embedding client if EMBEDDING_PROVIDER=openai.
@@ -49,11 +52,22 @@ export class LlmService {
   private readonly embeddingDimension: number;
 
   constructor() {
-    // ── LLM / Vision client (Gemini via OpenAI-compat endpoint) ────
     this.client = new OpenAI({
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
       baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
+
+    const geminiKey = process.env['GEMINI_API_KEY'];
+    const geminiBaseUrl =
+      process.env['GEMINI_BASE_URL'] ||
+      'https://generativelanguage.googleapis.com/v1beta/openai';
+
+    this.visionClient = geminiKey
+      ? new OpenAI({
+          apiKey: geminiKey,
+          baseURL: geminiBaseUrl,
+        })
+      : this.client;
 
     // ── Embeddings configuration (Cohere or OpenAI) ────────────────
     this.cohereApiKey =
@@ -74,7 +88,9 @@ export class LlmService {
         : null;
 
     this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
-    this.visionModel = process.env['DEFAULT_VISION_MODEL'] ?? 'groq/compound-mini';
+    this.visionModel =
+      process.env['DEFAULT_VISION_MODEL'] ??
+      (geminiKey ? 'gemini-2.5-flash' : 'groq/compound-mini');
     this.embeddingModel =
       process.env['DEFAULT_EMBEDDING_MODEL'] ??
       (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');
@@ -153,13 +169,15 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
     const startTime = Date.now();
 
     // Guard: only models that support vision (image_url) content blocks
-    // Groq/compound-mini and other text-only models reject array content → 400
+    const hasGemini = !!process.env['GEMINI_API_KEY'];
     const isVisionCapable =
-      this.visionModel.includes('gpt-4') ||
-      this.visionModel.includes('gpt-4o') ||
-      this.visionModel.includes('vision') ||
-      this.visionModel.includes('claude-3') ||
-      this.visionModel.includes('gemini');
+      hasGemini ||
+      (!((process.env['OPENAI_BASE_URL'] || '').includes('groq.com')) &&
+        (this.visionModel.includes('gpt-4') ||
+          this.visionModel.includes('gpt-4o') ||
+          this.visionModel.includes('vision') ||
+          this.visionModel.includes('claude-3') ||
+          this.visionModel.includes('gemini')));
 
     if (!isVisionCapable) {
       this.logger.warn(
@@ -207,7 +225,7 @@ Return JSON in this exact structure:
 }`;
 
     try {
-      const response = await this.client.chat.completions.create({
+      const response = await this.visionClient.chat.completions.create({
         model: this.visionModel,
         messages: [
           {
@@ -222,7 +240,7 @@ Return JSON in this exact structure:
           },
         ],
         response_format: { type: 'json_object' },
-        max_tokens: 2500,
+        max_tokens: 4096,
         temperature: 0,
       });
 
@@ -282,13 +300,15 @@ Return JSON in this exact structure:
     cropBuffer: Buffer,
     originalText: string,
   ): Promise<{ text: string; confidence: number }> {
+    const hasGemini = !!process.env['GEMINI_API_KEY'];
     const isVisionCapable =
-      !((process.env['OPENAI_BASE_URL'] || '').includes('groq.com')) &&
-      (this.visionModel.includes('gpt-4') ||
-        this.visionModel.includes('gpt-4o') ||
-        this.visionModel.includes('vision') ||
-        this.visionModel.includes('claude-3') ||
-        this.visionModel.includes('gemini'));
+      hasGemini ||
+      (!((process.env['OPENAI_BASE_URL'] || '').includes('groq.com')) &&
+        (this.visionModel.includes('gpt-4') ||
+          this.visionModel.includes('gpt-4o') ||
+          this.visionModel.includes('vision') ||
+          this.visionModel.includes('claude-3') ||
+          this.visionModel.includes('gemini')));
 
     if (!isVisionCapable) {
       return { text: originalText, confidence: 0.75 };
@@ -307,7 +327,7 @@ Return JSON only:
 }`;
 
     try {
-      const response = await this.client.chat.completions.create({
+      const response = await this.visionClient.chat.completions.create({
         model: this.visionModel,
         messages: [
           {
@@ -319,7 +339,7 @@ Return JSON only:
           },
         ],
         response_format: { type: 'json_object' },
-        max_tokens: 200,
+        max_tokens: 1000,
         temperature: 0,
       });
 

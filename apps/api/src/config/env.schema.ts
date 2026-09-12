@@ -40,7 +40,11 @@ export const envSchema = z.object({
   OPENAI_BASE_URL: z.string().optional(),
   DEFAULT_LLM_PROVIDER: z.string().default('groq'),
   DEFAULT_LLM_MODEL: z.string().default('groq/compound-mini'),
-  DEFAULT_VISION_MODEL: z.string().default('groq/compound-mini'),
+
+  // AI — Vision (Gemini via OpenAI-compat endpoint)
+  GEMINI_API_KEY: z.string().optional(),
+  GEMINI_BASE_URL: z.string().optional(),
+  DEFAULT_VISION_MODEL: z.string().default('gemini-2.5-flash'),
 
   // AI — Embeddings (Cohere embed-v4.0 or OpenAI text-embedding-3-small)
   COHERE_API_KEY: z.string().optional(),

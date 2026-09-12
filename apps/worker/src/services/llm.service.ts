@@ -28,6 +28,7 @@ export interface VisionOcrBlockJson {
 export class LlmService {
   private readonly logger = new Logger(LlmService.name);
   private readonly client: OpenAI;
+  private readonly visionClient: OpenAI;
   private readonly embeddingClient: OpenAI | null;
   private readonly cohereApiKey?: string;
   private readonly embeddingProvider: string;
@@ -41,6 +42,18 @@ export class LlmService {
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
       baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
+
+    const geminiKey = process.env['GEMINI_API_KEY'];
+    const geminiBaseUrl =
+      process.env['GEMINI_BASE_URL'] ||
+      'https://generativelanguage.googleapis.com/v1beta/openai';
+
+    this.visionClient = geminiKey
+      ? new OpenAI({
+          apiKey: geminiKey,
+          baseURL: geminiBaseUrl,
+        })
+      : this.client;
 
     this.cohereApiKey =
       process.env['COHERE_API_KEY'] ||
@@ -60,7 +73,9 @@ export class LlmService {
         : null;
 
     this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
-    this.visionModel = process.env['DEFAULT_VISION_MODEL'] ?? 'groq/compound-mini';
+    this.visionModel =
+      process.env['DEFAULT_VISION_MODEL'] ??
+      (geminiKey ? 'gemini-2.5-flash' : 'groq/compound-mini');
     this.embeddingModel =
       process.env['DEFAULT_EMBEDDING_MODEL'] ??
       (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');
@@ -138,11 +153,12 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
   ): Promise<OcrPageResult> {
     const startTime = Date.now();
 
-    // Groq models do not support multimodal image input
+    // Groq models do not support multimodal image input; proceed only if Gemini or multimodal provider is configured
+    const hasGemini = !!process.env['GEMINI_API_KEY'];
     const isGroq = (process.env['OPENAI_BASE_URL'] || '').includes('groq.com');
-    if (isGroq) {
+    if (!hasGemini && isGroq) {
       this.logger.debug(
-        `[Page ${pageNumber}] Vision LLM fallback skipped: Groq does not support multimodal image input`,
+        `[Page ${pageNumber}] Vision LLM fallback skipped: Groq does not support multimodal image input and GEMINI_API_KEY is not set`,
       );
       return {
         pageNumber,
@@ -186,7 +202,7 @@ Return JSON in this exact structure:
 }`;
 
     try {
-      const response = await this.client.chat.completions.create({
+      const response = await this.visionClient.chat.completions.create({
         model: this.visionModel,
         messages: [
           {
@@ -201,7 +217,7 @@ Return JSON in this exact structure:
           },
         ],
         response_format: { type: 'json_object' },
-        max_tokens: 2500,
+        max_tokens: 4096,
         temperature: 0,
       });
 
@@ -237,6 +253,7 @@ Return JSON in this exact structure:
         pageLanguage: parsed.language ?? 'hi+en',
         processingTimeMs: Date.now() - startTime,
         fallbackUsed: true,
+        fallbackProvider: hasGemini ? 'gemini-vision' : 'vlm',
       };
     } catch (err) {
       this.logger.error(`VLM OCR extraction failed for page ${pageNumber}: ${String(err)}`);
@@ -261,8 +278,9 @@ Return JSON in this exact structure:
     cropBuffer: Buffer,
     originalText: string,
   ): Promise<{ text: string; confidence: number }> {
+    const hasGemini = !!process.env['GEMINI_API_KEY'];
     const isGroq = (process.env['OPENAI_BASE_URL'] || '').includes('groq.com');
-    if (isGroq) {
+    if (!hasGemini && isGroq) {
       return { text: originalText, confidence: 0.75 };
     }
 
@@ -279,7 +297,7 @@ Return JSON only:
 }`;
 
     try {
-      const response = await this.client.chat.completions.create({
+      const response = await this.visionClient.chat.completions.create({
         model: this.visionModel,
         messages: [
           {
@@ -291,7 +309,7 @@ Return JSON only:
           },
         ],
         response_format: { type: 'json_object' },
-        max_tokens: 200,
+        max_tokens: 1000,
         temperature: 0,
       });
 
