@@ -217,11 +217,15 @@ Return JSON in this exact structure:
           },
         ],
         response_format: { type: 'json_object' },
-        max_tokens: 4096,
+        max_tokens: 8192,
         temperature: 0,
       });
 
-      const content = response.choices[0]?.message?.content ?? '{}';
+      const choice = response.choices[0];
+      const content = choice?.message?.content ?? '{}';
+      this.logger.log(
+        `[Page ${pageNumber}] VLM response in ${Date.now() - startTime}ms: finish_reason=${choice?.finish_reason}, tokens=${response.usage?.total_tokens ?? '?'}, content_len=${content.length}`,
+      );
       const parsed = this.parseJsonSafe<{
         containsHandwriting?: boolean;
         language?: string;

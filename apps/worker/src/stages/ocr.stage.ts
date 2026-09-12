@@ -170,11 +170,14 @@ export class OcrStage extends BaseStage {
 
             try {
               const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
+              this.logger.log(
+                `[${ctx.documentId}] VLM result for page ${pageNum}: blocks=${vlmResult.blocks?.length ?? 0}, chars=${vlmResult.rawText?.length ?? 0}, confidence=${vlmResult.pageConfidence}`,
+              );
               if (vlmResult.blocks.length > 0 && vlmResult.rawText.trim().length > 0) {
                 result = vlmResult;
               }
-            } catch {
-              // VLM fallback failed or unavailable
+            } catch (vlmErr) {
+              this.logger.error(`[${ctx.documentId}] VLM fallback failed for page ${pageNum}: ${String(vlmErr)}`);
             }
 
             // If VLM produced no text (or was skipped because LLM is text-only), fall back to built-in Tesseract OCR
