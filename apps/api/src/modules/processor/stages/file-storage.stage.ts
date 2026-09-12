@@ -87,7 +87,7 @@ export class FileStorageStage extends BaseStage {
       const loadingTask = pdfjs.getDocument({
         data: new Uint8Array(pdfBuffer),
         useSystemFonts: true,
-        disableFontFace: true,
+        disableFontFace: false,
       });
       const doc = await loadingTask.promise;
       const page = await doc.getPage(1);

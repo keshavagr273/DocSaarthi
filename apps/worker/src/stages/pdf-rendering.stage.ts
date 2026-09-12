@@ -50,7 +50,7 @@ export class PdfRenderingStage extends BaseStage {
       const loadingTask = pdfjs.getDocument({
         data: new Uint8Array(pdfBuffer),
         useSystemFonts: true,
-        disableFontFace: true,
+        disableFontFace: false,
       });
       const doc = await loadingTask.promise;
       const pageCount = doc.numPages;

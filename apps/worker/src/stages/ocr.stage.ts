@@ -81,7 +81,7 @@ export class OcrStage extends BaseStage {
           const doc = await pdfjs.getDocument({
             data: new Uint8Array(pdfBuf),
             useSystemFonts: true,
-            disableFontFace: true,
+            disableFontFace: false,
           }).promise;
           const page = await doc.getPage(pageNum);
           const textContent = await page.getTextContent();
