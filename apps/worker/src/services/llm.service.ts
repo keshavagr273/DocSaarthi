@@ -76,11 +76,15 @@ export class LlmService {
     this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
     this.visionModel =
       process.env['DEFAULT_VISION_MODEL'] ??
-      (geminiKey ? 'gemini-2.5-flash' : 'groq/compound-mini');
+      (geminiKey ? 'gemini-3.5-flash' : 'groq/compound-mini');
     this.embeddingModel =
       process.env['DEFAULT_EMBEDDING_MODEL'] ??
       (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');
     this.embeddingDimension = Number(process.env['EMBEDDING_DIMENSION'] ?? 1536);
+
+    this.logger.log(
+      `LlmService initialized: chatModel=${this.chatModel} | visionModel=${this.visionModel} | hasGeminiKey=${!!geminiKey} | embeddingProvider=${this.embeddingProvider}`,
+    );
   }
 
   getEmbeddingModel(): string {
@@ -207,30 +211,73 @@ Return valid JSON:
 }`;
 
     try {
-      const response = await this.visionClient.chat.completions.create({
-        model: this.visionModel,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              {
-                type: 'image_url',
-                image_url: { url: dataUri, detail: 'high' },
-              },
-            ],
-          },
-        ],
-        response_format: { type: 'json_object' },
-        max_tokens: 8192,
-        temperature: 0,
-      });
+      const candidateModels = Array.from(
+      new Set([
+        this.visionModel,
+        'gemini-3.5-flash',
+        'gemini-3.1-flash-lite',
+        'gemini-flash-latest',
+        'gemini-3.5-flash-lite',
+      ]),
+    );
 
-      const choice = response.choices[0];
-      const content = choice?.message?.content ?? '{}';
-      this.logger.log(
-        `[Page ${pageNumber}] VLM response in ${Date.now() - startTime}ms: finish_reason=${choice?.finish_reason}, tokens=${response.usage?.total_tokens ?? '?'}, content_len=${content.length}`,
+    let lastError: unknown = null;
+    let response: any = null;
+    let usedModel = this.visionModel;
+
+    for (const modelToTry of candidateModels) {
+      try {
+        response = await this.visionClient.chat.completions.create({
+          model: modelToTry,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: prompt },
+                {
+                  type: 'image_url',
+                  image_url: { url: dataUri, detail: 'high' },
+                },
+              ],
+            },
+          ],
+          response_format: { type: 'json_object' },
+          max_tokens: 8192,
+          temperature: 0,
+        });
+        usedModel = modelToTry;
+        break;
+      } catch (err: any) {
+        lastError = err;
+        const msg = String(err?.message || err);
+        this.logger.warn(
+          `VLM attempt with model "${modelToTry}" failed on page ${pageNumber}: ${msg}. Trying fallback candidate...`,
+        );
+      }
+    }
+
+    if (!response) {
+      this.logger.error(
+        `All VLM model candidates failed for page ${pageNumber}: ${String(lastError)}`,
       );
+      return {
+        pageNumber,
+        width,
+        height,
+        blocks: [],
+        rawText: '',
+        pageConfidence: 0,
+        pageLanguage: 'unknown',
+        processingTimeMs: Date.now() - startTime,
+        fallbackUsed: true,
+      };
+    }
+
+    const choice = response.choices[0];
+    const content = choice?.message?.content ?? '{}';
+    this.logger.log(
+      `[Page ${pageNumber}] VLM response via "${usedModel}" in ${Date.now() - startTime}ms: finish_reason=${choice?.finish_reason}, tokens=${response.usage?.total_tokens ?? '?'}, content_len=${content.length}`,
+    );
       const parsed = this.parseJsonSafe<{
         containsHandwriting?: boolean;
         language?: string;
