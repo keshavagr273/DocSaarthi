@@ -16,8 +16,9 @@ export interface ExtractionResult {
 
 export interface VisionOcrBlockJson {
   text: string;
-  bbox: [number, number, number, number];
-  confidence: number;
+  bbox?: [number, number, number, number];
+  box_2d?: [number, number, number, number];
+  confidence?: number;
   blockType?: string;
 }
 
@@ -176,27 +177,31 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
     const base64Image = imageBuffer.toString('base64');
     const dataUri = `data:image/png;base64,${base64Image}`;
 
-    const prompt = `You are a high-accuracy multilingual OCR system specializing in Indian documents (Hindi Devanagari and English).
-Examine this image and extract ALL readable text.
-Organize the text into structured blocks according to reading order.
-For each block, estimate:
-1. "text": The exact text transcribed faithfully.
-2. "bbox": [x1, y1, x2, y2] bounding box coordinates in pixels, where image width is ${width} and height is ${height}.
-3. "confidence": Confidence score between 0.0 and 1.0 (0.95+ for clear printed text, 0.7-0.9 for faint/handwritten).
-4. "blockType": "header" | "paragraph" | "table_cell" | "footer" | "signature" | "handwriting".
+    const prompt = `You are a high-accuracy multilingual OCR and document understanding system specializing in Indian documents (Hindi Devanagari and English), including handwritten letters, forms, and notes on lined/ruled paper.
 
-Also determine if this page contains any handwritten text.
+Carefully examine this image and extract ALL text lines from the very top to the very bottom without skipping any text. Include headers, dates, addresses, salutations, all body lines, and closing signatures/names.
 
-Return JSON in this exact structure:
+For each line, return:
+1. "text": The faithful transcription. For Hindi, accurately transcribe Devanagari characters, matras, conjuncts, nuktas, halant, and punctuation (such as '।' and ',').
+2. "box_2d": [ymin, xmin, ymax, xmax] normalized coordinates from 0 to 1000 representing the bounding box tightly enclosing this line.
+   - ymin: top boundary of the text line
+   - xmin: left boundary where the first character starts
+   - ymax: bottom boundary of the text line
+   - xmax: right boundary where the line ends
+   Tightly wrap the actual characters of that line. Do NOT span into empty margins or empty ruled lines.
+3. "confidence": Confidence score between 0.0 and 1.0 (0.90-1.0 for clearly readable text).
+4. "blockType": "header" | "paragraph" | "salutation" | "closing" | "signature" | "handwriting".
+
+Return valid JSON:
 {
   "containsHandwriting": boolean,
   "language": "hi" | "en" | "hi+en",
   "blocks": [
     {
       "text": "...",
-      "bbox": [x1, y1, x2, y2],
-      "confidence": 0.95,
-      "blockType": "paragraph"
+      "box_2d": [ymin, xmin, ymax, xmax],
+      "confidence": 0.98,
+      "blockType": "handwriting"
     }
   ]
 }`;
@@ -230,16 +235,60 @@ Return JSON in this exact structure:
         containsHandwriting?: boolean;
         language?: string;
         blocks?: VisionOcrBlockJson[];
+        lines?: VisionOcrBlockJson[];
       }>(content, {});
 
-      const blocks: OcrBlock[] = (parsed.blocks ?? []).map((b, idx) => ({
-        id: `vlm_block_${pageNumber}_${idx}`,
-        text: b.text,
-        bbox: b.bbox && b.bbox.length === 4 ? b.bbox : [0, idx * 30, width, (idx + 1) * 30],
-        confidence: typeof b.confidence === 'number' ? b.confidence : 0.85,
-        readingOrder: idx,
-        blockType: b.blockType ?? 'paragraph',
-      }));
+      const rawItems = parsed.blocks ?? parsed.lines ?? [];
+      const blocks: OcrBlock[] = rawItems
+        .filter((b) => b && typeof b.text === 'string' && b.text.trim().length > 0)
+        .map((b, idx) => {
+          let bbox: [number, number, number, number];
+
+          if (Array.isArray(b.box_2d) && b.box_2d.length === 4) {
+            // [ymin, xmin, ymax, xmax] normalized 0-1000 scale from spatial grounding
+            const [ymin, xmin, ymax, xmax] = b.box_2d;
+            const x1 = Math.max(0, Math.min(width, Math.round((Math.min(xmin, xmax) / 1000) * width)));
+            const y1 = Math.max(0, Math.min(height, Math.round((Math.min(ymin, ymax) / 1000) * height)));
+            const x2 = Math.max(0, Math.min(width, Math.round((Math.max(xmin, xmax) / 1000) * width)));
+            const y2 = Math.max(0, Math.min(height, Math.round((Math.max(ymin, ymax) / 1000) * height)));
+            bbox = [x1, y1, x2, y2];
+          } else if (Array.isArray(b.bbox) && b.bbox.length === 4) {
+            const [c0, c1, c2, c3] = b.bbox;
+            if (c2 <= 1.0 && c3 <= 1.0) {
+              // 0.0 - 1.0 normalized [x1, y1, x2, y2]
+              bbox = [
+                Math.round(c0 * width),
+                Math.round(c1 * height),
+                Math.round(c2 * width),
+                Math.round(c3 * height),
+              ];
+            } else if (Math.max(c0, c1, c2, c3) <= 1000 && (width > 1000 || height > 1000)) {
+              // 0 - 1000 normalized [x1, y1, x2, y2]
+              bbox = [
+                Math.round((c0 / 1000) * width),
+                Math.round((c1 / 1000) * height),
+                Math.round((c2 / 1000) * width),
+                Math.round((c3 / 1000) * height),
+              ];
+            } else {
+              bbox = [Math.round(c0), Math.round(c1), Math.round(c2), Math.round(c3)];
+            }
+          } else {
+            bbox = [0, idx * 30, width, (idx + 1) * 30];
+          }
+
+          return {
+            id: `vlm_block_${pageNumber}_${idx}`,
+            text: b.text.trim().replace(/\0/g, ''),
+            bbox,
+            confidence:
+              typeof b.confidence === 'number'
+                ? Math.max(0.1, Math.min(1.0, b.confidence))
+                : 0.95,
+            readingOrder: idx,
+            blockType: b.blockType ?? 'paragraph',
+          };
+        });
 
       const rawText = blocks.map((b) => b.text).join('\n');
       const pageConfidence =

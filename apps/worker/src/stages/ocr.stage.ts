@@ -150,56 +150,85 @@ export class OcrStage extends BaseStage {
       // ── Step 2: Fall back to image-based OCR (PaddleOCR / VLM) ────
       if (!result) {
         if (buffer.length > 0) {
-          // Try PaddleOCR sidecar
-          const paddleResult = await this.ocrClient.recognizePage(buffer, pageNum);
+          const ocrProvider = (process.env['OCR_PROVIDER'] || 'paddle').toLowerCase();
+          const fallbackThreshold = Number(process.env['OCR_FALLBACK_THRESHOLD'] ?? 0.75);
 
-          if (paddleResult.pageConfidence < 0.70 || paddleResult.fallbackUsed || paddleResult.blocks.length === 0) {
+          let width = 1000;
+          let height = 1400;
+          try {
+            const meta = await sharp(buffer).metadata();
+            width = meta.width ?? width;
+            height = meta.height ?? height;
+          } catch {
+            // keep defaults
+          }
+
+          // Direct Vision / VLM routing if configured as primary provider
+          if (ocrProvider === 'vision' || ocrProvider === 'vlm' || ocrProvider === 'gemini') {
             this.logger.log(
-              `[${ctx.documentId}] Page ${pageNum} confidence=${paddleResult.pageConfidence.toFixed(2)}. Attempting VLM OCR...`,
+              `[${ctx.documentId}] Using primary Vision OCR (${ocrProvider}) for page ${pageNum}...`,
             );
-
-            let width = paddleResult.width || 1000;
-            let height = paddleResult.height || 1400;
-            try {
-              const meta = await sharp(buffer).metadata();
-              width = meta.width ?? width;
-              height = meta.height ?? height;
-            } catch {
-              // keep defaults
-            }
-
             try {
               const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
-              this.logger.log(
-                `[${ctx.documentId}] VLM result for page ${pageNum}: blocks=${vlmResult.blocks?.length ?? 0}, chars=${vlmResult.rawText?.length ?? 0}, confidence=${vlmResult.pageConfidence}`,
-              );
               if (vlmResult.blocks.length > 0 && vlmResult.rawText.trim().length > 0) {
                 result = vlmResult;
               }
             } catch (vlmErr) {
-              this.logger.error(`[${ctx.documentId}] VLM fallback failed for page ${pageNum}: ${String(vlmErr)}`);
+              this.logger.error(`[${ctx.documentId}] Vision OCR failed for page ${pageNum}: ${String(vlmErr)}`);
             }
+          }
 
-            // If VLM produced no text (or was skipped because LLM is text-only), fall back to built-in Tesseract OCR
-            if (!result || result.blocks.length === 0 || !result.rawText.trim()) {
+          // If not configured for direct vision or vision failed, try PaddleOCR sidecar
+          if (!result) {
+            const paddleResult = await this.ocrClient.recognizePage(buffer, pageNum);
+            width = paddleResult.width || width;
+            height = paddleResult.height || height;
+
+            // Trigger VLM fallback if confidence is low, sidecar failed/offline, or very few blocks detected
+            const shouldFallbackToVlm =
+              paddleResult.pageConfidence < fallbackThreshold ||
+              paddleResult.fallbackUsed ||
+              paddleResult.blocks.length === 0 ||
+              (paddleResult.blocks.length < 5 && buffer.length > 50_000);
+
+            if (shouldFallbackToVlm) {
               this.logger.log(
-                `[${ctx.documentId}] Running built-in Tesseract OCR for page ${pageNum}...`,
+                `[${ctx.documentId}] Page ${pageNum} confidence=${paddleResult.pageConfidence.toFixed(2)}, blocks=${paddleResult.blocks.length}. Attempting VLM OCR...`,
               );
-              try {
-                const tessResult = await this.runTesseractOcr(buffer, pageNum, width, height);
-                if (tessResult.rawText.trim().length > 0) {
-                  result = tessResult;
-                }
-              } catch (tessErr) {
-                this.logger.warn(`[${ctx.documentId}] Tesseract OCR failed on page ${pageNum}: ${String(tessErr)}`);
-              }
-            }
 
-            if (!result) {
+              try {
+                const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
+                this.logger.log(
+                  `[${ctx.documentId}] VLM result for page ${pageNum}: blocks=${vlmResult.blocks?.length ?? 0}, chars=${vlmResult.rawText?.length ?? 0}, confidence=${vlmResult.pageConfidence}`,
+                );
+                if (vlmResult.blocks.length > 0 && vlmResult.rawText.trim().length > 0) {
+                  result = vlmResult;
+                }
+              } catch (vlmErr) {
+                this.logger.error(`[${ctx.documentId}] VLM fallback failed for page ${pageNum}: ${String(vlmErr)}`);
+              }
+
+              // If VLM produced no text (or was skipped because LLM is text-only), fall back to built-in Tesseract OCR
+              if (!result || result.blocks.length === 0 || !result.rawText.trim()) {
+                this.logger.log(
+                  `[${ctx.documentId}] Running built-in Tesseract OCR for page ${pageNum}...`,
+                );
+                try {
+                  const tessResult = await this.runTesseractOcr(buffer, pageNum, width, height);
+                  if (tessResult.rawText.trim().length > 0) {
+                    result = tessResult;
+                  }
+                } catch (tessErr) {
+                  this.logger.warn(`[${ctx.documentId}] Tesseract OCR failed on page ${pageNum}: ${String(tessErr)}`);
+                }
+              }
+
+              if (!result) {
+                result = paddleResult;
+              }
+            } else {
               result = paddleResult;
             }
-          } else {
-            result = paddleResult;
           }
         } else {
           this.logger.warn(`[${ctx.documentId}] Empty buffer for page ${pageNum}, returning empty OCR result`);
