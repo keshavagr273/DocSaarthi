@@ -165,6 +165,12 @@ export class SearchService {
     const cleanQuery = query.trim();
     if (!cleanQuery) return [];
 
+    const words = cleanQuery
+      .split(/\s+/)
+      .map((w) => w.replace(/['":*&|!()\\]/g, '').trim())
+      .filter((w) => w.length >= 2);
+    const searchWords = words.length > 0 ? words : [cleanQuery];
+
     let docFilter = Prisma.sql`AND d."userId" = ${userId} AND d."isDeleted" = false`;
     if (filters.documentId) {
       docFilter = Prisma.sql`${docFilter} AND d.id = ${filters.documentId}`;
@@ -204,14 +210,21 @@ export class SearchService {
           dc."sectionTitle" AS section_title,
           dc.content,
           GREATEST(
-            ts_rank(to_tsvector('english', dc.content), plainto_tsquery('english', ${cleanQuery})),
-            CASE WHEN dc.content ILIKE ${'%' + cleanQuery + '%'} THEN 0.75 ELSE 0 END
+            CASE WHEN dc.content ILIKE ${'%' + cleanQuery + '%'} THEN 0.95 ELSE 0 END,
+            ts_rank(to_tsvector('english', dc.content), plainto_tsquery('english', ${cleanQuery})) * 1.5,
+            ts_rank(to_tsvector('english', dc.content), websearch_to_tsquery('english', ${cleanQuery})) * 1.2,
+            0.15
           ) AS keyword_score
         FROM document_chunks dc
         JOIN documents d ON dc."documentId" = d.id
         WHERE (
           to_tsvector('english', dc.content) @@ plainto_tsquery('english', ${cleanQuery})
+          OR to_tsvector('english', dc.content) @@ websearch_to_tsquery('english', ${cleanQuery})
           OR dc.content ILIKE ${'%' + cleanQuery + '%'}
+          OR EXISTS (
+            SELECT 1 FROM unnest(${searchWords}::text[]) word
+            WHERE length(word) >= 3 AND dc.content ILIKE '%' || word || '%'
+          )
         )
         ${docFilter}
         ORDER BY keyword_score DESC
