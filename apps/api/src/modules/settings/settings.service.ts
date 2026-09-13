@@ -13,6 +13,13 @@ import { UpdateProfileDto, ChangePasswordDto, CreateApiKeyDto } from './dto/sett
 
 @Injectable()
 export class SettingsService {
+  private readonly ARGON2_OPTIONS: argon2.Options = {
+    type: argon2.argon2id,
+    memoryCost: 65536, // 64 MB
+    timeCost: 3,
+    parallelism: 1,
+  };
+
   constructor(
     private readonly db: DatabaseService,
     private readonly audit: AuditService,
@@ -64,7 +71,7 @@ export class SettingsService {
       throw new UnauthorizedException('Current password is incorrect');
     }
 
-    const newPasswordHash = await argon2.hash(dto.newPassword);
+    const newPasswordHash = await argon2.hash(dto.newPassword, this.ARGON2_OPTIONS);
     await this.db.user.update({
       where: { id: userId },
       data: { passwordHash: newPasswordHash },

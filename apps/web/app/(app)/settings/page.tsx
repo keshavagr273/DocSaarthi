@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   User as UserIcon,
@@ -13,6 +14,8 @@ import {
   AlertCircle,
   CheckCircle2,
   Globe,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import {
   authApi,
@@ -25,6 +28,7 @@ import { cn, formatDate } from '../../../lib/utils';
 import toast from 'react-hot-toast';
 
 export default function SettingsPage() {
+  const router = useRouter();
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'profile' | 'security' | 'audit'>('profile');
 
@@ -38,6 +42,11 @@ export default function SettingsPage() {
   const [name, setName] = useState('');
   const [preferredLang, setPreferredLang] = useState('en');
   const [initializedProfile, setInitializedProfile] = useState(false);
+
+  // Password Visibility State
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
   if (user && !initializedProfile) {
     setName(user.name ?? '');
@@ -70,19 +79,60 @@ export default function SettingsPage() {
         currentPassword,
         newPassword,
       }),
-    onSuccess: () => {
-      toast.success('Password changed successfully');
+    onSuccess: (res) => {
+      const msg =
+        (res?.data as { data?: { message?: string } })?.data?.message ||
+        'Password updated successfully. Please log in again.';
+      toast.success(msg);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
+      // Invalidate active auth queries and redirect to login after a brief pause
+      setTimeout(async () => {
+        try {
+          await authApi.logout();
+        } catch {
+          // ignore any logout error
+        }
+        router.push('/login');
+      }, 1500);
     },
-    onError: () => toast.error('Failed to update password. Check current password.'),
+    onError: (err: unknown) => {
+      const errorData = (
+        err as {
+          response?: {
+            data?: {
+              error?: { message?: string };
+              message?: string | string[];
+            };
+          };
+        }
+      )?.response?.data;
+
+      let msg = errorData?.error?.message;
+      if (!msg) {
+        if (Array.isArray(errorData?.message)) {
+          msg = errorData.message.join('; ');
+        } else if (typeof errorData?.message === 'string') {
+          msg = errorData.message;
+        }
+      }
+      toast.error(msg ?? 'Failed to update password. Check current password.');
+    },
   });
 
   const handlePasswordSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!currentPassword || currentPassword.length < 6) {
+      toast.error('Current password must be at least 6 characters');
+      return;
+    }
     if (newPassword.length < 8) {
       toast.error('New password must be at least 8 characters');
+      return;
+    }
+    if (newPassword === currentPassword) {
+      toast.error('New password must be different from current password');
       return;
     }
     if (newPassword !== confirmPassword) {
@@ -240,42 +290,79 @@ export default function SettingsPage() {
           <form onSubmit={handlePasswordSubmit} className="space-y-4">
             <div>
               <label className="label">Current Password</label>
-              <input
-                type="password"
-                required
-                value={currentPassword}
-                onChange={(e) => setCurrentPassword(e.target.value)}
-                className="input"
-                placeholder="••••••••"
-              />
+              <div className="relative">
+                <input
+                  type={showCurrentPassword ? 'text' : 'password'}
+                  required
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  className="input pr-10"
+                  placeholder="••••••••"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowCurrentPassword((prev) => !prev)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 hover:text-white/70 transition-colors"
+                  tabIndex={-1}
+                >
+                  {showCurrentPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
             </div>
 
             <div>
               <label className="label">New Password (min 8 characters)</label>
-              <input
-                type="password"
-                required
-                minLength={8}
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                className="input"
-                placeholder="••••••••"
-              />
+              <div className="relative">
+                <input
+                  type={showNewPassword ? 'text' : 'password'}
+                  required
+                  minLength={8}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="input pr-10"
+                  placeholder="••••••••"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNewPassword((prev) => !prev)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 hover:text-white/70 transition-colors"
+                  tabIndex={-1}
+                >
+                  {showNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
             </div>
 
             <div>
               <label className="label">Confirm New Password</label>
-              <input
-                type="password"
-                required
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                className="input"
-                placeholder="••••••••"
-              />
+              <div className="relative">
+                <input
+                  type={showConfirmPassword ? 'text' : 'password'}
+                  required
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  className="input pr-10"
+                  placeholder="••••••••"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirmPassword((prev) => !prev)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 hover:text-white/70 transition-colors"
+                  tabIndex={-1}
+                >
+                  {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
             </div>
 
-            <div className="pt-3">
+            <div className="p-3 rounded-2xl bg-white/[0.02] border border-white/[0.06] text-[11px] text-white/50 flex items-start gap-2">
+              <Shield className="w-4 h-4 text-brand-400 shrink-0 mt-0.5" />
+              <span>
+                For security, changing your password invalidates active sessions and refresh tokens on all devices. You will be redirected to sign in again.
+              </span>
+            </div>
+
+            <div className="pt-2">
               <button
                 type="submit"
                 disabled={changePasswordMutation.isPending}

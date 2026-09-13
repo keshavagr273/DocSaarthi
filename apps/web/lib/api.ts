@@ -33,7 +33,12 @@ api.interceptors.response.use(
       _retry?: boolean;
     };
 
-    if (error.response?.status === 401 && !originalRequest._retry) {
+    const isAuthBypassUrl =
+      originalRequest?.url?.includes('/auth/login') ||
+      originalRequest?.url?.includes('/auth/refresh') ||
+      originalRequest?.url?.includes('/settings/password');
+
+    if (error.response?.status === 401 && !originalRequest._retry && !isAuthBypassUrl) {
       if (isRefreshing) {
         return new Promise((resolve) => {
           refreshQueue.push(() => {
