@@ -34,8 +34,7 @@ export default function LoginPage() {
     try {
       await authApi.login(data);
       toast.success('Welcome back!');
-      router.push('/dashboard');
-      router.refresh();
+      window.location.href = '/dashboard';
     } catch (err: unknown) {
       const msg =
         (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error

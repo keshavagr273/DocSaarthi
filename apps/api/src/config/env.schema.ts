@@ -21,6 +21,7 @@ export const envSchema = z.object({
   MINIO_BUCKET: z.string().default('docsaarthi'),
   MINIO_USE_SSL: z.string().transform((v) => v === 'true').default('false'),
   MINIO_PRESIGN_EXPIRY_SECONDS: z.coerce.number().default(3600),
+  CLOUDFLARE_API_TOKEN: z.string().optional(),
 
   // JWT
   ACCESS_TOKEN_SECRET: z.string().min(32, 'ACCESS_TOKEN_SECRET must be at least 32 chars'),
@@ -39,7 +40,7 @@ export const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
   DEFAULT_LLM_PROVIDER: z.string().default('groq'),
-  DEFAULT_LLM_MODEL: z.string().default('groq/compound-mini'),
+  DEFAULT_LLM_MODEL: z.string().default('groq/llama3-8b-8192'),
 
   // AI — Vision (Gemini via OpenAI-compat endpoint)
   GEMINI_API_KEY: z.string().optional(),

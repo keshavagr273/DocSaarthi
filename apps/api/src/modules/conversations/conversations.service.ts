@@ -28,7 +28,7 @@ export class ConversationsService {
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
       baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/llama3-8b-8192';
   }
 
   // ── Conversation Management ───────────────────────────────────────

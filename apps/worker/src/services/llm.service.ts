@@ -73,10 +73,10 @@ export class LlmService {
           })
         : null;
 
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/compound-mini';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/llama3-8b-8192';
     this.visionModel =
       process.env['DEFAULT_VISION_MODEL'] ??
-      (geminiKey ? 'gemini-3.5-flash' : 'groq/compound-mini');
+      (geminiKey ? 'gemini-3.5-flash' : 'groq/llama3-8b-8192');
     this.embeddingModel =
       process.env['DEFAULT_EMBEDDING_MODEL'] ??
       (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');

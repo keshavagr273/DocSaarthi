@@ -40,8 +40,6 @@ export type { DocumentProcessingJobData };
 @Processor(QUEUES.DOCUMENT_PROCESSING)
 export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DocumentProcessor.name);
-  private pollingTimer: NodeJS.Timeout | null = null;
-  private activeProcessingIds = new Set<string>();
 
   constructor(
     private readonly db: DatabaseService,
@@ -62,67 +60,15 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
-    this.logger.log('Starting DB polling worker daemon for QUEUED documents...');
-    this.pollingTimer = setInterval(() => {
-      this.pollQueuedDocuments().catch((err) => {
-        this.logger.error('Error in DB polling worker loop:', err);
-      });
-    }, 3000);
+    // DB poller disabled: BullMQ handles queue persistence and retries.
+    // Running processDocumentJob directly bypasses queue concurrency controls.
   }
 
   onModuleDestroy(): void {
-    if (this.pollingTimer) {
-      clearInterval(this.pollingTimer);
-      this.pollingTimer = null;
-    }
+    // No-op
   }
 
-  private async pollQueuedDocuments(): Promise<void> {
-    const queuedDocs = await this.db.document.findMany({
-      where: {
-        status: DocumentStatus.QUEUED,
-        currentVersionId: { not: null },
-      },
-      include: {
-        versions: true,
-      },
-      take: 3,
-      orderBy: { createdAt: 'asc' },
-    });
 
-    for (const doc of queuedDocs) {
-      if (this.activeProcessingIds.has(doc.id)) continue;
-
-      const version = doc.versions.find((v) => v.id === doc.currentVersionId) ?? doc.versions[0];
-      if (!version || version.storageKey === 'PENDING') continue;
-
-      this.activeProcessingIds.add(doc.id);
-      this.logger.log(`[DB Poller] Found queued document ${doc.id} ("${doc.title}"). Dispatching pipeline...`);
-
-      const syntheticJob = {
-        id: `poll-${doc.id}`,
-        data: {
-          documentId: doc.id,
-          versionId: version.id,
-          userId: doc.userId,
-          storageKey: version.storageKey,
-          mimeType: doc.mimeType,
-        },
-        progress: async () => {},
-        attemptsMade: 0,
-        opts: { attempts: 1 },
-      } as unknown as Job<DocumentProcessingJobData>;
-
-      // Run pipeline asynchronously so loop stays non-blocking
-      this.processDocumentJob(syntheticJob)
-        .catch((err) => {
-          this.logger.error(`[DB Poller] Processing failed for document ${doc.id}: ${String(err)}`);
-        })
-        .finally(() => {
-          this.activeProcessingIds.delete(doc.id);
-        });
-    }
-  }
 
   // ── Job lifecycle hooks ──────────────────────────────────────────
 
