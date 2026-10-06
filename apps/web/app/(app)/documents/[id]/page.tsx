@@ -390,7 +390,7 @@ function DocumentMainView({
   onOpenCategoryModal: () => void;
 }) {
   const [currentPageNum, setCurrentPageNum] = useState(1);
-  const [showOcrBoxes, setShowOcrBoxes] = useState(true);
+  const [showOcrBoxes, setShowOcrBoxes] = useState(false);
   const [zoomLevel, setZoomLevel] = useState(100);
   const [viewMode, setViewMode] = useState<'visual' | 'text' | 'json'>('visual');
   const [textSearch, setTextSearch] = useState('');
@@ -624,6 +624,9 @@ function DocumentMainView({
                       const widthPct = ((x2 - x1) / imgW) * 100;
                       const heightPct = ((y2 - y1) / imgH) * 100;
 
+                      // Skip blocks that are too tiny to be meaningful
+                      if (widthPct < 0.3 || heightPct < 0.3) return null;
+
                       const isHigh = block.confidence >= 0.85;
                       const isMed = block.confidence >= 0.65 && block.confidence < 0.85;
 
@@ -633,16 +636,16 @@ function DocumentMainView({
                           style={{
                             left: `${leftPct}%`,
                             top: `${topPct}%`,
-                            width: `${Math.max(2, widthPct)}%`,
-                            height: `${Math.max(1.5, heightPct)}%`,
+                            width: `${widthPct}%`,
+                            height: `${heightPct}%`,
                           }}
                           className={cn(
                             'absolute border transition-all cursor-pointer group rounded-[2px]',
                             isHigh
-                              ? 'border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/30'
+                              ? 'border-emerald-500/60 bg-emerald-500/5 hover:bg-emerald-500/20'
                               : isMed
-                              ? 'border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/30'
-                              : 'border-red-500/50 bg-red-500/15 hover:bg-red-500/35',
+                              ? 'border-amber-500/60 bg-amber-500/5 hover:bg-amber-500/20'
+                              : 'border-red-500/60 bg-red-500/5 hover:bg-red-500/20',
                           )}
                         >
                           {/* Tooltip */}
