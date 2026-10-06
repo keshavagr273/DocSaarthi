@@ -124,7 +124,7 @@ ${snippet}
 
 Respond with valid JSON only (no markdown formatting, no text outside JSON):
 {
-  "category": "<one of: GOVERNMENT_NOTICE, INVOICE, RECEIPT, CERTIFICATE, COLLEGE_DOCUMENT, BANK_DOCUMENT, LEGAL_DOCUMENT, EMPLOYMENT_DOCUMENT, FORM, LETTER, IDENTITY_DOCUMENT, MEDICAL_DOCUMENT, INSURANCE_DOCUMENT, TAX_DOCUMENT, UNKNOWN>",
+  "category": "<one of: GOVERNMENT_NOTICE, INVOICE, RECEIPT, CERTIFICATE, COLLEGE_DOCUMENT, BANK_DOCUMENT, LEGAL_DOCUMENT, EMPLOYMENT_DOCUMENT, FORM, LETTER, IDENTITY_DOCUMENT, MEDICAL_DOCUMENT, INSURANCE_DOCUMENT, TAX_DOCUMENT, RESUME, PASSPORT, UTILITY_BILL, PROPERTY_DOCUMENT, TRANSPORT_DOCUMENT, FINANCIAL_REPORT, UNKNOWN>",
   "confidence": <0.0 to 1.0>,
   "reasoning": "<one sentence explanation in English>",
   "key_indicators": ["<key phrase or header found in document>", "<another indicator>"]
@@ -815,6 +815,55 @@ Respond with valid JSON:
 - tax_payable (CURRENCY): Tax amount payable or refund due
 - gross_income (CURRENCY): Gross total income
 - filing_date (DATE): Date of filing or acknowledgment`,
+
+      RESUME: `
+- candidate_name (NAME): Full name of the candidate
+- email (TEXT): Email address
+- phone (ID_NUMBER): Contact phone number
+- education (LIST): Degrees, colleges, or universities attended
+- skills (LIST): Technical or professional skills listed
+- experience (LIST): Past companies or job titles`,
+
+      PASSPORT: `
+- passport_number (ID_NUMBER): Passport number
+- full_name (NAME): Given names and surname
+- nationality (TEXT): Nationality or citizenship
+- date_of_birth (DATE): Date of birth
+- place_of_birth (TEXT): Place of birth
+- issue_date (DATE): Date of issue
+- expiry_date (DATE): Date of expiry`,
+
+      UTILITY_BILL: `
+- provider_name (NAME): Electricity, water, gas, or telecom company name
+- consumer_number (ID_NUMBER): Consumer, account, or CA number
+- bill_date (DATE): Date the bill was generated
+- due_date (DATE): Payment due date
+- total_amount (CURRENCY): Total amount payable
+- consumer_address (ADDRESS): Address of the consumer`,
+
+      PROPERTY_DOCUMENT: `
+- document_type (TEXT): Sale Deed, Lease Agreement, Registry, etc.
+- property_address (ADDRESS): Address of the property
+- buyer_tenant_name (NAME): Name of the buyer or tenant
+- seller_landlord_name (NAME): Name of the seller or landlord
+- transaction_value (CURRENCY): Sale value, rent amount, or deposit
+- execution_date (DATE): Date the document was signed or registered`,
+
+      TRANSPORT_DOCUMENT: `
+- document_type (TEXT): Driving License, RC Book, Challan, Permit
+- registration_number (ID_NUMBER): Vehicle Registration Number or DL Number
+- holder_name (NAME): Name of the owner or driver
+- vehicle_class (TEXT): Class of vehicle (e.g., MCWG, LMV, Transport)
+- issue_date (DATE): Date of issue or challan date
+- validity (DATE): Valid till date`,
+
+      FINANCIAL_REPORT: `
+- company_name (NAME): Name of the company
+- report_type (TEXT): Balance Sheet, P&L, Audit Report, etc.
+- financial_year (TEXT): Financial year covered (e.g., 2025-26)
+- total_revenue (CURRENCY): Total revenue or turnover
+- net_profit (CURRENCY): Net profit or loss
+- auditor_name (NAME): Name of the auditor or firm`,
 
       UNKNOWN: `
 - document_title (TEXT): Heading or title of the document
