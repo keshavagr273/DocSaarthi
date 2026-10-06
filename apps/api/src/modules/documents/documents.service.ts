@@ -738,6 +738,17 @@ export class DocumentsService {
       // ignore
     }
 
+    // Also expose a presigned URL for the original version file so the frontend
+    // can render it natively in the browser (avoids server-side font rendering issues).
+    let pdfUrl: string | null = null;
+    try {
+      if (targetVersion.storageKey) {
+        pdfUrl = await this.storage.createPresignedDownloadUrl(targetVersion.storageKey, 3600);
+      }
+    } catch {
+      // ignore
+    }
+
     const ocrResult = await this.db.ocrResult.findFirst({
       where: { versionId: targetVersion.id, pageNumber: pageNum },
       select: {
@@ -753,7 +764,7 @@ export class DocumentsService {
       },
     });
 
-    return { documentId, page: { ...page, imageUrl }, ocrResult };
+    return { documentId, page: { ...page, imageUrl }, pdfUrl, ocrResult };
   }
 
   // ── Get Extracted Fields ─────────────────────────────────────

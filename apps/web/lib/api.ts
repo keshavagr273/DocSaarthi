@@ -171,7 +171,7 @@ export const documentsApi = {
     ),
 
   getPage: (documentId: string, pageNum: number, versionId?: string) =>
-    api.get<{ data: { documentId: string; page: DocumentPage; ocrResult: OcrResult | null } }>(
+    api.get<{ data: { documentId: string; page: DocumentPage; pdfUrl?: string | null; ocrResult: OcrResult | null } }>(
       `/documents/${documentId}/pages/${pageNum}`,
       { params: { versionId } },
     ),

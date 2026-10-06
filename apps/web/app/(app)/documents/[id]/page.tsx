@@ -589,76 +589,88 @@ function DocumentMainView({
 
           {/* 1. Visual Image Mode */}
           {viewMode === 'visual' && (
-            <div className="relative overflow-auto max-h-[680px] rounded-xl bg-black/40 border border-white/[0.04] flex items-center justify-center p-4">
-              <div
-                className="relative transition-all duration-200"
-                style={{
-                  width: `${zoomLevel}%`,
-                  maxWidth: zoomLevel > 100 ? 'none' : '100%',
-                }}
-              >
-                {currentPage?.imageUrl ? (
-                  // eslint-disable-next-line
-                  <img
-                    src={currentPage.imageUrl}
-                    alt={`Page ${currentPageNum}`}
-                    className="w-full h-auto rounded-lg shadow-2xl pointer-events-none select-none"
-                  />
-                ) : (
-                  <div className="w-full aspect-[1/1.4] bg-white/[0.02] border border-white/[0.06] rounded-xl flex flex-col items-center justify-center text-white/30 space-y-2">
-                    <FileText className="w-12 h-12 opacity-30" />
-                    <p className="text-xs">Page {currentPageNum} Rendering</p>
+            <div className="relative overflow-hidden rounded-xl bg-black/40 border border-white/[0.04]" style={{ height: '680px' }}>
+              {/* Native PDF rendering via browser iframe — perfect font rendering */}
+              {pageDetail?.pdfUrl ? (
+                <iframe
+                  key={`${pageDetail.pdfUrl}-${currentPageNum}`}
+                  src={`${pageDetail.pdfUrl}#page=${currentPageNum}&toolbar=0&navpanes=0&scrollbar=0&view=FitH`}
+                  className="w-full h-full rounded-xl border-0"
+                  title={`Page ${currentPageNum}`}
+                  style={{ background: 'white' }}
+                />
+              ) : currentPage?.imageUrl ? (
+                /* Fallback: server-rendered PNG (may have font issues) */
+                <div
+                  className="relative h-full overflow-auto flex items-center justify-center p-4"
+                >
+                  <div
+                    className="relative transition-all duration-200"
+                    style={{
+                      width: `${zoomLevel}%`,
+                      maxWidth: zoomLevel > 100 ? 'none' : '100%',
+                    }}
+                  >
+                    {/* eslint-disable-next-line */}
+                    <img
+                      src={currentPage.imageUrl}
+                      alt={`Page ${currentPageNum}`}
+                      className="w-full h-auto rounded-lg shadow-2xl pointer-events-none select-none"
+                    />
+
+                    {/* OCR Bounding Boxes Overlay (only available in PNG fallback mode) */}
+                    {showOcrBoxes && ocrBlocks.length > 0 && (
+                      <div className="absolute inset-0 pointer-events-auto">
+                        {ocrBlocks.map((block) => {
+                          const [x1, y1, x2, y2] = block.bbox;
+                          const imgW = pageDetail?.page?.width || 1000;
+                          const imgH = pageDetail?.page?.height || 1400;
+
+                          const leftPct = (x1 / imgW) * 100;
+                          const topPct = (y1 / imgH) * 100;
+                          const widthPct = ((x2 - x1) / imgW) * 100;
+                          const heightPct = ((y2 - y1) / imgH) * 100;
+
+                          if (widthPct < 0.3 || heightPct < 0.3) return null;
+
+                          const isHigh = block.confidence >= 0.85;
+                          const isMed = block.confidence >= 0.65 && block.confidence < 0.85;
+
+                          return (
+                            <div
+                              key={block.id}
+                              style={{
+                                left: `${leftPct}%`,
+                                top: `${topPct}%`,
+                                width: `${widthPct}%`,
+                                height: `${heightPct}%`,
+                              }}
+                              className={cn(
+                                'absolute border transition-all cursor-pointer group rounded-[2px]',
+                                isHigh
+                                  ? 'border-emerald-500/60 bg-emerald-500/5 hover:bg-emerald-500/20'
+                                  : isMed
+                                  ? 'border-amber-500/60 bg-amber-500/5 hover:bg-amber-500/20'
+                                  : 'border-red-500/60 bg-red-500/5 hover:bg-red-500/20',
+                              )}
+                            >
+                              <div className="absolute left-1/2 -top-8 -translate-x-1/2 hidden group-hover:flex items-center gap-1.5 px-2 py-1 bg-surface-100 border border-white/20 rounded-lg shadow-xl text-[10px] text-white z-30 whitespace-nowrap pointer-events-none">
+                                <span className="font-semibold">{Math.round(block.confidence * 100)}%</span>
+                                <span className="text-white/60 truncate max-w-[160px]">{block.text}</span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
-                )}
-
-                {/* OCR Bounding Boxes Overlay */}
-                {showOcrBoxes && ocrBlocks.length > 0 && (
-                  <div className="absolute inset-0 pointer-events-auto">
-                    {ocrBlocks.map((block) => {
-                      const [x1, y1, x2, y2] = block.bbox;
-                      const imgW = pageDetail?.page?.width || 1000;
-                      const imgH = pageDetail?.page?.height || 1400;
-
-                      const leftPct = (x1 / imgW) * 100;
-                      const topPct = (y1 / imgH) * 100;
-                      const widthPct = ((x2 - x1) / imgW) * 100;
-                      const heightPct = ((y2 - y1) / imgH) * 100;
-
-                      // Skip blocks that are too tiny to be meaningful
-                      if (widthPct < 0.3 || heightPct < 0.3) return null;
-
-                      const isHigh = block.confidence >= 0.85;
-                      const isMed = block.confidence >= 0.65 && block.confidence < 0.85;
-
-                      return (
-                        <div
-                          key={block.id}
-                          style={{
-                            left: `${leftPct}%`,
-                            top: `${topPct}%`,
-                            width: `${widthPct}%`,
-                            height: `${heightPct}%`,
-                          }}
-                          className={cn(
-                            'absolute border transition-all cursor-pointer group rounded-[2px]',
-                            isHigh
-                              ? 'border-emerald-500/60 bg-emerald-500/5 hover:bg-emerald-500/20'
-                              : isMed
-                              ? 'border-amber-500/60 bg-amber-500/5 hover:bg-amber-500/20'
-                              : 'border-red-500/60 bg-red-500/5 hover:bg-red-500/20',
-                          )}
-                        >
-                          {/* Tooltip */}
-                          <div className="absolute left-1/2 -top-8 -translate-x-1/2 hidden group-hover:flex items-center gap-1.5 px-2 py-1 bg-surface-100 border border-white/20 rounded-lg shadow-xl text-[10px] text-white z-30 whitespace-nowrap pointer-events-none">
-                            <span className="font-semibold">{Math.round(block.confidence * 100)}%</span>
-                            <span className="text-white/60 truncate max-w-[160px]">{block.text}</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+                </div>
+              ) : (
+                <div className="w-full h-full flex flex-col items-center justify-center text-white/30 space-y-2">
+                  <FileText className="w-12 h-12 opacity-30" />
+                  <p className="text-xs">Loading page {currentPageNum}...</p>
+                </div>
+              )}
             </div>
           )}
 
