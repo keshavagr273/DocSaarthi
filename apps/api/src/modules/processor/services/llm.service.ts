@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import OpenAI from 'openai';
 import type { ExtractedField, OcrBlock, OcrPageResult } from '../stages/pipeline-context';
 
@@ -7,11 +7,21 @@ export interface ClassificationResult {
   confidence: number;
   reasoning: string;
   keyIndicators: string[];
+  /**
+   * Set when the provider call itself failed (bad model id, auth, network).
+   * Distinguishes "the model could not be reached" from "the model looked at
+   * this document and could not categorise it" — the two used to be
+   * indistinguishable, so a wrong DEFAULT_LLM_MODEL produced a document that
+   * completed successfully with category UNKNOWN.
+   */
+  error?: string;
 }
 
 export interface ExtractionResult {
   fields: ExtractedField[];
   extractionNotes?: string;
+  /** Set when the provider call failed, as opposed to finding no fields. */
+  error?: string;
 }
 
 export interface EmbedBatchResult {
@@ -132,7 +142,7 @@ function normaliseEnumToken(value: unknown): string {
  *                       or OpenAI fallback if configured.
  */
 @Injectable()
-export class LlmService {
+export class LlmService implements OnModuleInit {
   private readonly logger = new Logger(LlmService.name);
 
   /** Primary client — used for chat completions (points at Groq). */
@@ -203,6 +213,62 @@ export class LlmService {
     );
   }
 
+  /**
+   * Verify at boot that the configured chat model actually exists.
+   *
+   * Classification and extraction both swallow their errors and return
+   * UNKNOWN / no fields, so a wrong or retired DEFAULT_LLM_MODEL does not
+   * fail anything visibly — every document just completes with no category
+   * and no extracted data. That has now happened three times with three
+   * different dead model ids, so the condition is reported loudly at startup
+   * instead of being discovered document by document.
+   *
+   * This never throws: a provider outage at boot must not stop the API from
+   * serving traffic.
+   */
+  async onModuleInit(): Promise<void> {
+    const result = await this.checkChatModel();
+    if (result.ok) {
+      this.logger.log(`Chat model "${this.chatModel}" verified reachable.`);
+      return;
+    }
+
+    this.logger.error(
+      `CHAT MODEL UNAVAILABLE — "${this.chatModel}": ${result.detail}\n` +
+      '  Document classification and field extraction will silently produce\n' +
+      '  category=UNKNOWN with zero extracted fields until this is fixed.\n' +
+      `  List the models this key can reach:\n` +
+      `    curl -s ${(process.env['OPENAI_BASE_URL'] || 'https://api.openai.com/v1').replace(/\/$/, '')}/models \\\n` +
+      '      -H "Authorization: Bearer $OPENAI_API_KEY"',
+    );
+  }
+
+  /**
+   * Cheapest possible liveness check for the configured chat model.
+   * Used at startup and by the health endpoint.
+   */
+  async checkChatModel(): Promise<{ ok: boolean; detail: string }> {
+    if (!process.env['OPENAI_API_KEY']) {
+      return { ok: false, detail: 'OPENAI_API_KEY is not set' };
+    }
+    try {
+      await this.client.chat.completions.create({
+        model: this.chatModel,
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 1,
+        temperature: 0,
+      });
+      return { ok: true, detail: 'reachable' };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, detail: message.split('\n')[0] ?? message };
+    }
+  }
+
+  getChatModel(): string {
+    return this.chatModel;
+  }
+
   getEmbeddingModel(): string {
     return this.embeddingModel;
   }
@@ -267,8 +333,15 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
         keyIndicators: Array.isArray(parsed.key_indicators) ? parsed.key_indicators : [],
       };
     } catch (err) {
-      this.logger.error(`Classification LLM call failed: ${String(err)}`);
-      return { category: 'UNKNOWN', confidence: 0, reasoning: 'LLM error', keyIndicators: [] };
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Classification LLM call failed: ${message}`);
+      return {
+        category: 'UNKNOWN',
+        confidence: 0,
+        reasoning: 'LLM error',
+        keyIndicators: [],
+        error: message,
+      };
     }
   }
 
@@ -679,8 +752,9 @@ Respond with valid JSON only:
 
       return { fields, extractionNotes: parsed.extractionNotes };
     } catch (err) {
-      this.logger.error(`Extraction LLM call failed: ${String(err)}`);
-      return { fields: [] };
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Extraction LLM call failed: ${message}`);
+      return { fields: [], error: message };
     }
   }
 

@@ -78,6 +78,20 @@ export class ClassificationStage extends BaseStage {
 
     const result = await this.llm.classifyDocument(ocrText);
 
+    if (result.error) {
+      // Do not record UNKNOWN as if the model had considered the document.
+      // Throwing lets BullMQ retry a transient outage, and surfaces a
+      // misconfigured model as a real failure instead of a silently empty
+      // document that looks successfully processed.
+      await this.markStageFailed(
+        ctx.versionId,
+        'LLM_UNAVAILABLE',
+        `Classification provider error: ${result.error}`,
+        ctx,
+      );
+      throw new Error(`LLM_UNAVAILABLE: classification failed — ${result.error}`);
+    }
+
     // Apply minimum confidence threshold. `result.category` is already
     // validated against the DocumentCategory enum by LlmService, so it is
     // always safe to write.

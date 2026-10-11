@@ -222,15 +222,52 @@ npm run reembed -- --yes
 SELECT model, dimension, COUNT(*) FROM document_embeddings GROUP BY 1, 2;
 ```
 
+### Never share a Redis prefix between environments
+
+`REDIS_PREFIX` namespaces the BullMQ queue. Two environments pointing at the
+same Redis with the same prefix **share one work queue**, so whichever process
+grabs a job first processes it — a developer's laptop will pick up a production
+upload, download that document from production object storage and write results
+back to the production database.
+
+Give every environment its own prefix (`docsaarthi:dev:`, `docsaarthi:prod:`)
+or its own Redis instance. To check what a running service is actually using:
+
+```bash
+curl -s "$API_URL/api/health" | jq '.data.info.queues'
+```
+
+Identical `completed`/`failed` counts across two environments means they are
+sharing a queue.
+
 ### Health and queue state
 
 ```bash
 curl -s http://localhost:3001/api/health | jq
 ```
 
-Reports database, storage, LLM-key and queue depth. A document that is stuck
-shows as `PROCESSING` with no terminal state; `npm run reprocess -- --stuck
---yes` requeues those.
+Reports database, storage, chat-model and queue state. The LLM check makes a
+real one-token call rather than just confirming a key is present, so a retired
+or misspelled `DEFAULT_LLM_MODEL` shows as `degraded` with the provider's error
+instead of a misleading `ok`:
+
+```json
+"llmProvider": {
+  "status": "down",
+  "model": "llama-3.1-8b-instant",
+  "error": "404 The model `llama-3.1-8b-instant` does not exist..."
+}
+```
+
+The same check runs at startup and logs a loud `CHAT MODEL UNAVAILABLE` error.
+This matters because classification and extraction degrade silently: with an
+unreachable model every document used to finish as `COMPLETED` with category
+`UNKNOWN` and zero fields. They now fail the job instead, so BullMQ retries a
+transient outage and a genuine misconfiguration surfaces as a failed document
+with `LLM_UNAVAILABLE` rather than a quietly empty one.
+
+A document that is stuck shows as `PROCESSING` with no terminal state;
+`npm run reprocess -- --stuck --yes` requeues those.
 
 ### Diagnosing a document that produced nothing
 

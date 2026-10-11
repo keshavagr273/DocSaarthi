@@ -77,7 +77,19 @@ export class StructuredExtractionStage extends BaseStage {
       );
     }
 
-    const { fields } = await this.llm.extractFields(text, category, language);
+    const { fields, error: extractionError } = await this.llm.extractFields(text, category, language);
+
+    if (extractionError) {
+      // Same reasoning as classification: "provider unreachable" must not be
+      // recorded as "this document has no fields".
+      await this.markStageFailed(
+        ctx.versionId,
+        'LLM_UNAVAILABLE',
+        `Extraction provider error: ${extractionError}`,
+        ctx,
+      );
+      throw new Error(`LLM_UNAVAILABLE: field extraction failed — ${extractionError}`);
+    }
 
     // ── Clear previous extractions, keeping human work ──────────
     // DocumentField rows are per-document, not per-version, and the review UI

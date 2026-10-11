@@ -74,5 +74,7 @@ const ALL_STAGES = [
     // Main BullMQ processor
     DocumentProcessor,
   ],
+  // HealthModule probes the configured chat model through this service.
+  exports: [LlmService],
 })
 export class ProcessorModule {}

@@ -4,6 +4,13 @@ import { Public } from '../../common/decorators/public.decorator';
 import { DatabaseService } from '@docsaarthi/database';
 import { StorageService } from '../storage/storage.service';
 import { QueueService } from '../queue/queue.service';
+import { LlmService } from '../processor/services/llm.service';
+
+/**
+ * The LLM probe costs a real API call, and health is polled, so the result is
+ * cached briefly. A dead model stays dead for far longer than this window.
+ */
+const LLM_PROBE_TTL_MS = 60_000;
 
 @ApiTags('health')
 @Controller()
@@ -12,7 +19,19 @@ export class HealthController {
     private readonly db: DatabaseService,
     private readonly storage: StorageService,
     private readonly queue: QueueService,
+    private readonly llm: LlmService,
   ) {}
+
+  private llmProbe: { at: number; ok: boolean; detail: string } | null = null;
+
+  private async probeLlm(): Promise<{ ok: boolean; detail: string }> {
+    if (this.llmProbe && Date.now() - this.llmProbe.at < LLM_PROBE_TTL_MS) {
+      return { ok: this.llmProbe.ok, detail: this.llmProbe.detail };
+    }
+    const result = await this.llm.checkChatModel();
+    this.llmProbe = { at: Date.now(), ...result };
+    return result;
+  }
 
   @Public()
   @Get('api/health')
@@ -42,8 +61,22 @@ export class HealthController {
       storageStatus = 'down';
     }
 
-    // LLM Provider Status
-    const hasKey = Boolean(process.env['OPENAI_API_KEY']);
+    // LLM provider. Checking only that a key is present reported "up" while
+    // the configured model returned 404 on every call, which is exactly the
+    // failure that silently emptied every document's category and fields.
+    // Actually call the model.
+    let llmStatus = 'down';
+    let llmDetail = '';
+    let llmDuration = 0;
+    try {
+      const start = Date.now();
+      const probe = await this.probeLlm();
+      llmDuration = Date.now() - start;
+      llmStatus = probe.ok ? 'up' : 'down';
+      llmDetail = probe.detail;
+    } catch (err) {
+      llmDetail = err instanceof Error ? err.message : String(err);
+    }
 
     // Queue stats
     let queueStats = null;
@@ -53,7 +86,9 @@ export class HealthController {
       queueStats = { active: 0, waiting: 0, completed: 0, failed: 0 };
     }
 
-    const overallStatus = dbStatus === 'up' ? 'ok' : 'degraded';
+    // A reachable database is not enough to call this service healthy: with
+    // the chat model down, uploads still succeed but produce nothing useful.
+    const overallStatus = dbStatus === 'up' && llmStatus === 'up' ? 'ok' : 'degraded';
 
     return {
       status: overallStatus,
@@ -67,9 +102,11 @@ export class HealthController {
           responseMs: storageDuration,
         },
         llmProvider: {
-          status: hasKey ? 'up' : 'down',
+          status: llmStatus,
           provider: process.env['DEFAULT_LLM_PROVIDER'] ?? 'groq',
-          model: process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-120b',
+          model: this.llm.getChatModel(),
+          responseMs: llmDuration,
+          ...(llmStatus === 'down' ? { error: llmDetail } : {}),
         },
         queues: {
           status: 'up',
