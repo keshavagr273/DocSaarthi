@@ -117,12 +117,14 @@ Every ingested document is classified into one of 10 specialized Indian schemas:
                │                       │                       │
        BullMQ  │            PostgreSQL │ + pgvector            │ S3 API
 ┌──────────────▼─────────────┐ ┌───────▼────────────────┐ ┌────▼──────────────┐
-│  Async Ingestion Worker    │ │   Supabase / Postgres  │ │    MinIO / S3     │
-│  - File Validator          │ │   - Documents & Chunks │ │   - Original PDFs │
-│  - PaddleOCR Python Engine │ │   - Extracted Fields   │ │   - Rendered PNGs │
-│  - Groq / OpenAI LLM       │ │   - Vector Embeddings  │ │   - Thumbnails    │
-│  - pgvector Ingestor       │ │   - Audit Trail Logs   │ └───────────────────┘
-└────────────────────────────┘ └────────────────────────┘
+│  Ingestion Pipeline        │ │   Supabase / Postgres  │ │  MinIO / S3 / R2  │
+│  (14 stages, in the API    │ │   - Documents & Chunks │ │   - Original PDFs │
+│   process via BullMQ)      │ │   - Extracted Fields   │ │   - Rendered PNGs │
+│  - File Validator          │ │   - Vector Embeddings  │ │   - Thumbnails    │
+│  - PaddleOCR / Vision OCR  │ │   - Audit Trail Logs   │ └───────────────────┘
+│  - Groq LLM + Cohere Embed │ │                        │
+│  - pgvector Ingestor       │ └────────────────────────┘
+└────────────────────────────┘
 ```
 
 ---
@@ -141,6 +143,105 @@ Every ingested document is classified into one of 10 specialized Indian schemas:
 │ RAG Chat │◄───┤  Embeddings │◄───┤  & Semantic  │◄───┤  Scoring &  │◄──────────┘
 │ Ready    │    │  Stored     │    │  Vectors     │    │  Validation │
 └──────────┘    └─────────────┘    └──────────────┘    └─────────────┘
+```
+
+The pipeline is **14 discrete stages** run in order by a single BullMQ consumer
+inside the API process (`apps/api/src/modules/processor`):
+
+| # | Stage | What it does |
+|---|---|---|
+| 1 | `FILE_VALIDATION` | Confirms the object exists, checks PDF magic bytes, counts pages |
+| 2 | `FILE_STORAGE` | Renders a WebP thumbnail |
+| 3 | `PDF_RENDERING` | Rasterises every page to PNG at 2x and creates `document_pages` |
+| 4 | `IMAGE_PREPROCESSING` | Auto-orient, gamma, contrast stretch, unsharp mask |
+| 5 | `OCR` | PDF text layer → Vision LLM → PaddleOCR → Tesseract, first hit wins |
+| 6 | `LANGUAGE_DETECTION` | Devanagari vs Latin ratio per page, aggregated |
+| 7 | `DOCUMENT_CLASSIFICATION` | One of 21 categories (respects a manual override) |
+| 8 | `TEXT_NORMALIZATION` | NFC, zero-width strip, whitespace and line-ending cleanup |
+| 9 | `STRUCTURED_EXTRACTION` | Category-specific field schema (keeps verified fields) |
+| 10 | `CONFIDENCE_SCORING` | `0.7 × LLM + 0.3 × best matching OCR block` |
+| 11 | `VALIDATION` | Date/currency/GSTIN parsing, invoice math, chronology checks |
+| 12 | `CHUNKING` | 300–600 token target, hard-capped at 1000 |
+| 13 | `EMBEDDING` | Batched, Redis-cached, written to pgvector |
+| 14 | `INDEXING` | Verifies embeddings exist and the FTS query runs |
+
+Each stage records a marker in `document_versions.stageHistory`. On a retry the
+pipeline **skips** stages already marked `COMPLETED` and each skipped stage
+restores its own output from the database, so a resume cannot silently run a
+later stage against an empty context.
+
+---
+
+## Operations
+
+### Reprocessing existing documents
+
+After fixing a configuration or pipeline bug, re-run the pipeline over documents
+that are already uploaded. The API must be running — this only enqueues jobs.
+
+```bash
+# See what would be reprocessed and why — always start here
+npm run reprocess -- --dry-run
+
+# Repair everything that looks wrong (no fields, UNKNOWN category,
+# embeddings from a previous model, no chunks, stuck mid-pipeline)
+npm run reprocess -- --needs-repair --yes
+
+# Or target precisely
+npm run reprocess -- --stale-embeddings --yes
+npm run reprocess -- --id <documentId> --yes
+
+# Give documents whose original file is gone from storage a terminal FAILED
+# state, instead of leaving them QUEUED forever with no explanation
+npm run reprocess -- --needs-repair --fail-unusable --yes
+```
+
+The script checks that each source file still exists in object storage before
+enqueuing, and reports the ones that do not rather than queuing jobs that are
+certain to fail. Human-verified fields are preserved (the pipeline keeps rows
+with `isVerified`/`isRejected` set).
+
+Selectors: `--all`, `--needs-repair` (default), `--no-fields`, `--bad-category`,
+`--stale-embeddings`, `--no-chunks`, `--stuck`, `--id <documentId>`.
+
+### Re-embedding after an embedding-model change
+
+Semantic search only compares vectors from the **same** model, so switching
+`EMBEDDING_PROVIDER` / `DEFAULT_EMBEDDING_MODEL` silently drops every older
+document out of semantic results. Re-embedding the chunk text already in the
+database is far cheaper than a full reprocess, and works even for documents
+whose original file is no longer in storage:
+
+```bash
+npm run reembed -- --dry-run
+npm run reembed -- --yes
+```
+
+```sql
+-- Should return exactly one row once everything is consistent
+SELECT model, dimension, COUNT(*) FROM document_embeddings GROUP BY 1, 2;
+```
+
+### Health and queue state
+
+```bash
+curl -s http://localhost:3001/api/health | jq
+```
+
+Reports database, storage, LLM-key and queue depth. A document that is stuck
+shows as `PROCESSING` with no terminal state; `npm run reprocess -- --stuck
+--yes` requeues those.
+
+### Diagnosing a document that produced nothing
+
+```sql
+-- Which OCR engine actually read each page?
+SELECT "pageNumber", "ocrProvider", "fallbackProvider", "pageConfidence",
+       length("rawText") AS chars
+FROM ocr_results WHERE "versionId" = '<versionId>' ORDER BY "pageNumber";
+
+-- Where did the pipeline get to?
+SELECT jsonb_pretty("stageHistory"::jsonb) FROM document_versions WHERE id = '<versionId>';
 ```
 
 ---
@@ -207,10 +308,22 @@ This starts:
 ### Step 3: Run Migrations & Start Development Servers
 
 ```bash
-# Push database tables and pgvector schema
-npm run db:migrate:deploy
+# 1. Generate the Prisma client
+npm run db:generate
 
-# Start all applications (API, Web, Worker) in parallel
+# 2. Create the tables
+npm run db:migrate:deploy          # or: npm run db:push
+
+# 3. Create the pgvector column and the search indexes.
+#    Prisma cannot express the `vector` type, so the embedding column and the
+#    HNSW / full-text / trigram indexes live in raw SQL. The document pipeline
+#    writes to that column, so this step is REQUIRED, not optional.
+#    It is idempotent — safe to re-run on every deploy.
+npm run db:setup-search
+
+# 4. Start all applications (API + Web) in parallel.
+#    The document pipeline runs inside the API process — there is no
+#    separate worker service to start.
 npm run dev
 ```
 
@@ -239,10 +352,59 @@ All application parameters are environment-driven and validated via Zod:
 | `MINIO_BUCKET` | `docsaarthi` | S3 bucket name |
 | `OPENAI_API_KEY` | *(optional)* | Groq or OpenAI API key |
 | `OPENAI_BASE_URL` | `https://api.groq.com/openai/v1` | Custom LLM base URL (Groq, Ollama, etc.) |
-| `DEFAULT_LLM_MODEL` | `openai/gpt-oss-20b` | Chat model for RAG and field extraction |
+| `DEFAULT_LLM_MODEL` | `openai/gpt-oss-120b` | Chat model for RAG and field extraction |
+| `GEMINI_API_KEY` | *(optional)* | Enables Vision OCR for scans, photos and handwriting |
+| `DEFAULT_VISION_MODEL` | `gemini-3.5-flash` | Vision model used for image OCR |
+| `EMBEDDING_PROVIDER` | `cohere` | `cohere` or `openai` |
+| `DEFAULT_EMBEDDING_MODEL` | `embed-v4.0` | Embedding model |
+| `EMBEDDING_DIMENSION` | `1536` | Must match the `vector(N)` column width |
+| `ALLOW_FALLBACK_EMBEDDINGS` | `true` | See *Embedding fallback* below |
+| `EXTRACTION_TEXT_BUDGET_CHARS` | `16000` | OCR text sent to field extraction |
+| `EXTRACTION_MAX_RESPONSE_TOKENS` | `4000` | Response budget for field extraction |
+| `OCR_PROVIDER` | `paddle` | `paddle`, or `vision` to use the VLM first |
 | `OCR_PADDLE_URL` | `http://localhost:8081` | Python PaddleOCR microservice endpoint |
+| `OCR_PADDLE_TIMEOUT_MS` | `120000` | Per-page sidecar timeout |
+| `OCR_CIRCUIT_OPEN_MS` | `60000` | How long to skip the sidecar after a failure |
 | `ACCESS_TOKEN_SECRET` | *(required 32+ chars)* | Secret key for JWT signing |
 | `REFRESH_TOKEN_SECRET`| *(required 32+ chars)* | Secret key for refresh token rotation |
+| `PRISMA_LOG_QUERIES` | `false` | Echo every SQL query (very noisy) |
+
+### Choosing a chat model
+
+`OPENAI_BASE_URL` points at an OpenAI-**compatible** endpoint, so
+`DEFAULT_LLM_MODEL` must be a model id that endpoint serves, written exactly as
+that provider writes it. For Groq this is a bare id such as
+`openai/gpt-oss-120b`. A `provider/model` prefix of the LiteLLM/OpenRouter kind
+(for example `groq/llama3-8b-8192`) returns **404** from Groq, and Groq retires
+older models — list what your key can actually reach before setting it:
+
+```bash
+curl -s https://api.groq.com/openai/v1/models   -H "Authorization: Bearer $OPENAI_API_KEY" | jq -r '.data[].id'
+```
+
+Classification and extraction degrade silently if this is wrong: documents still
+finish, but every one of them lands as `UNKNOWN` with zero extracted fields.
+Check the startup log line to confirm what is actually loaded:
+
+```
+[LlmService] LlmService initialized: chatModel=openai/gpt-oss-120b | visionModel=gemini-3.5-flash | ...
+```
+
+### Embedding fallback
+
+If the embedding provider is unreachable, the pipeline can fall back to
+deterministic local hash vectors so ingestion keeps moving. These are **not**
+semantic: they are comparable only to each other. Such rows are stored under the
+model name `local-hash-fallback` so they can be found and re-embedded later:
+
+```sql
+SELECT DISTINCT "documentId" FROM document_embeddings WHERE model = 'local-hash-fallback';
+```
+
+Semantic search only compares vectors produced by the **same** model, so these
+rows simply will not match a real query vector (rather than returning nonsense).
+Set `ALLOW_FALLBACK_EMBEDDINGS=false` to fail the stage and let the job retry
+instead.
 
 ---
 
@@ -271,15 +433,15 @@ DocSaarthi/
 │   │   ├── src/common/          # Caching, Rate Limiting, API Key Guards
 │   │   ├── src/config/          # Zod Environment Validation Schema
 │   │   └── src/modules/         # Auth, Documents, Search, Conversations, Audit
-│   ├── web/                     # Next.js 15 Frontend Application
-│   │   ├── app/(app)/           # Dashboard, Studio, Search, Review, Settings
-│   │   ├── components/          # Glassmorphic UI Components
-│   │   └── lib/                 # Axios Client & TypeScript Interfaces
-│   └── worker/                  # BullMQ Async Document Processing Worker
-│       ├── src/stages/          # Validation, PaddleOCR, Classification, Embeddings
-│       └── src/services/        # LLM Client, Storage Client, OCR Sidecar Client
+│   │   └── src/modules/processor # 14-stage ingestion pipeline (BullMQ consumer)
+│   │       ├── stages/          # Validation, OCR, Classification, Chunking, Embedding
+│   │       └── services/        # LLM Client, OCR Sidecar Client
+│   └── web/                     # Next.js 15 Frontend Application
+│       ├── app/(app)/           # Dashboard, Studio, Search, Review, Settings
+│       ├── components/          # Glassmorphic UI Components
+│       └── lib/                 # Axios Client & TypeScript Interfaces
 ├── packages/
-│   ├── database/                # Prisma ORM Schema, pgvector Migrations, DatabaseService
+│   ├── database/                # Prisma ORM Schema, pgvector SQL, DatabaseService
 │   └── shared/                  # Shared Queue Names, Constants, and Key Generators
 ├── infra/
 │   ├── docker/                  # Dockerfiles (PaddleOCR Python Service, Multi-stage Apps)

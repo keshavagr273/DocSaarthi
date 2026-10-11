@@ -14,12 +14,113 @@ export interface ExtractionResult {
   extractionNotes?: string;
 }
 
+export interface EmbedBatchResult {
+  vectors: Float32Array[];
+  /** The model that actually produced these vectors — persist this one. */
+  model: string;
+  /** True when these are local hash vectors, not real semantic embeddings. */
+  isFallback: boolean;
+}
+
+/**
+ * Model name recorded for locally-generated hash vectors, so rows embedded
+ * during a provider outage can be found and re-embedded:
+ *   SELECT "documentId" FROM document_embeddings WHERE model = 'local-hash-fallback';
+ */
+export const FALLBACK_EMBEDDING_MODEL = 'local-hash-fallback';
+
+/**
+ * Whether to store non-semantic fallback vectors when the embedding provider
+ * is unreachable. Defaults to true to preserve existing behaviour; set to
+ * 'false' to fail the stage and let BullMQ retry instead.
+ */
+const ALLOW_FALLBACK_EMBEDDINGS = process.env['ALLOW_FALLBACK_EMBEDDINGS'] !== 'false';
+
 export interface VisionOcrBlockJson {
   text: string;
   bbox?: [number, number, number, number];
   box_2d?: [number, number, number, number];
   confidence?: number;
   blockType?: string;
+}
+
+/**
+ * Mirrors the Prisma `DocumentCategory` enum. Anything the model returns that
+ * is not in this set is coerced to UNKNOWN — writing an unrecognised value
+ * straight through made Prisma throw and failed the entire pipeline for that
+ * document, with the real cause (a one-word model deviation) buried in a
+ * Prisma validation error.
+ *
+ * Keep in sync with schema.prisma and with the category list in the
+ * classification prompt below.
+ */
+const DOCUMENT_CATEGORIES = new Set([
+  'GOVERNMENT_NOTICE',
+  'INVOICE',
+  'RECEIPT',
+  'CERTIFICATE',
+  'COLLEGE_DOCUMENT',
+  'BANK_DOCUMENT',
+  'LEGAL_DOCUMENT',
+  'EMPLOYMENT_DOCUMENT',
+  'FORM',
+  'LETTER',
+  'IDENTITY_DOCUMENT',
+  'MEDICAL_DOCUMENT',
+  'INSURANCE_DOCUMENT',
+  'TAX_DOCUMENT',
+  'RESUME',
+  'PASSPORT',
+  'UTILITY_BILL',
+  'PROPERTY_DOCUMENT',
+  'TRANSPORT_DOCUMENT',
+  'FINANCIAL_REPORT',
+  'UNKNOWN',
+]);
+
+/** Mirrors the Prisma `FieldType` enum. Unknown types are coerced to TEXT. */
+const FIELD_TYPES = new Set<ExtractedField['fieldType']>([
+  'TEXT',
+  'DATE',
+  'NUMBER',
+  'CURRENCY',
+  'LIST',
+  'BOOLEAN',
+  'ADDRESS',
+  'NAME',
+  'ID_NUMBER',
+]);
+
+/**
+ * How much OCR text to send to the extraction call. 4500 chars is roughly one
+ * dense page, so anything a multi-page document says past that was invisible
+ * to extraction. Overridable because the right value depends on the chat
+ * model's context window.
+ */
+const EXTRACTION_TEXT_BUDGET_CHARS = Number(
+  process.env['EXTRACTION_TEXT_BUDGET_CHARS'] ?? 16000,
+);
+
+/**
+ * Response budget for the extraction call. A schema with a dozen fields plus
+ * `extractionNotes` overruns 1500 tokens, and a truncated response is invalid
+ * JSON — which parseJsonSafe turned into "zero fields extracted" without a
+ * word of explanation.
+ */
+const EXTRACTION_MAX_RESPONSE_TOKENS = Number(
+  process.env['EXTRACTION_MAX_RESPONSE_TOKENS'] ?? 4000,
+);
+
+/**
+ * Normalise a model-supplied enum-ish string: "Government Notice",
+ * "government-notice" and "GOVERNMENT_NOTICE" all mean the same thing.
+ */
+function normaliseEnumToken(value: unknown): string {
+  return String(value ?? '')
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^A-Z0-9_]/g, '');
 }
 
 /**
@@ -88,10 +189,10 @@ export class LlmService {
           })
         : null;
 
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/llama3-8b-8192';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-120b';
     this.visionModel =
       process.env['DEFAULT_VISION_MODEL'] ??
-      (geminiKey ? 'gemini-3.5-flash' : 'groq/llama3-8b-8192');
+      (geminiKey ? 'gemini-3.5-flash' : 'openai/gpt-oss-120b');
     this.embeddingModel =
       process.env['DEFAULT_EMBEDDING_MODEL'] ??
       (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');
@@ -147,11 +248,23 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
         key_indicators?: string[];
       }>(content, {});
 
+      const normalised = normaliseEnumToken(parsed.category);
+      const category = DOCUMENT_CATEGORIES.has(normalised) ? normalised : 'UNKNOWN';
+      if (parsed.category && category === 'UNKNOWN' && normalised !== 'UNKNOWN') {
+        this.logger.warn(
+          `Classifier returned category "${parsed.category}" which is not a DocumentCategory value — treating as UNKNOWN`,
+        );
+      }
+
+      const rawConfidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0;
+
       return {
-        category: parsed.category ?? 'UNKNOWN',
-        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0,
+        category,
+        // An out-of-range confidence would propagate into the DB and the
+        // review queue's HIGH/MEDIUM/LOW bucketing.
+        confidence: Math.min(1, Math.max(0, rawConfidence)),
         reasoning: parsed.reasoning ?? '',
-        keyIndicators: parsed.key_indicators ?? [],
+        keyIndicators: Array.isArray(parsed.key_indicators) ? parsed.key_indicators : [],
       };
     } catch (err) {
       this.logger.error(`Classification LLM call failed: ${String(err)}`);
@@ -198,6 +311,7 @@ Respond with valid JSON only (no markdown formatting, no text outside JSON):
         pageLanguage: 'unknown',
         processingTimeMs: Date.now() - startTime,
         fallbackUsed: true,
+        provider: 'none',
       };
     }
 
@@ -293,6 +407,7 @@ Return valid JSON:
         pageLanguage: 'unknown',
         processingTimeMs: Date.now() - startTime,
         fallbackUsed: true,
+        provider: 'none',
       };
     }
 
@@ -376,6 +491,8 @@ Return valid JSON:
         pageLanguage: parsed.language ?? 'hi+en',
         processingTimeMs: Date.now() - startTime,
         fallbackUsed: true,
+        provider: 'vision',
+        fallbackProvider: usedModel,
       };
     } catch (err) {
       this.logger.error(`VLM OCR extraction failed for page ${pageNumber}: ${String(err)}`);
@@ -389,6 +506,7 @@ Return valid JSON:
         pageLanguage: 'unknown',
         processingTimeMs: Date.now() - startTime,
         fallbackUsed: true,
+        provider: 'none',
       };
     }
   }
@@ -484,7 +602,7 @@ FIELDS TO EXTRACT:
 ${schema}
 
 OCR TEXT:
-${ocrText.slice(0, 4500)}
+${ocrText.slice(0, EXTRACTION_TEXT_BUDGET_CHARS)}
 
 Respond with valid JSON only:
 {
@@ -506,10 +624,18 @@ Respond with valid JSON only:
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
         temperature: 0,
-        max_tokens: 1500,
+        max_tokens: EXTRACTION_MAX_RESPONSE_TOKENS,
       });
 
-      const content = response.choices[0]?.message?.content ?? '{}';
+      const choice = response.choices[0];
+      if (choice?.finish_reason === 'length') {
+        this.logger.warn(
+          `Extraction response hit the ${EXTRACTION_MAX_RESPONSE_TOKENS}-token limit and is truncated ` +
+          `(category=${category}). Raise EXTRACTION_MAX_RESPONSE_TOKENS.`,
+        );
+      }
+
+      const content = choice?.message?.content ?? '{}';
       const parsed = this.parseJsonSafe<{
         fields?: Array<{
           fieldName?: string;
@@ -530,12 +656,26 @@ Respond with valid JSON only:
         .filter((f) => f.fieldName.length > 0 && f.rawValue.length > 0)
         .map((f) => ({
           fieldName: f.fieldName,
-          fieldType: (f.fieldType as ExtractedField['fieldType']) ?? 'TEXT',
+          // `?? 'TEXT'` only caught null/undefined — a model returning
+          // "String" or "text" passed straight through to Prisma's FieldType
+          // enum and failed the createMany, taking the whole document with
+          // it. Validate against the enum instead.
+          fieldType: this.toFieldType(f.fieldType, f.fieldName),
           rawValue: f.rawValue,
           confidence: typeof f.confidence === 'number' ? Math.min(1, Math.max(0, f.confidence)) : 0.85,
-          sourcePage: typeof f.sourcePage === 'number' ? f.sourcePage : 1,
+          sourcePage:
+            typeof f.sourcePage === 'number' && Number.isFinite(f.sourcePage) && f.sourcePage >= 1
+              ? Math.floor(f.sourcePage)
+              : 1,
           extractionMethod: 'llm',
         }));
+
+      if (fields.length === 0) {
+        this.logger.warn(
+          `Extraction returned no usable fields for category=${category} ` +
+          `(response was ${content.length} chars, ${parsed.fields?.length ?? 0} raw entries)`,
+        );
+      }
 
       return { fields, extractionNotes: parsed.extractionNotes };
     } catch (err) {
@@ -583,18 +723,28 @@ Respond with valid JSON:
 
   // ── Embeddings ────────────────────────────────────────────────────
 
-  async embedBatch(texts: string[]): Promise<Float32Array[]> {
-    if (texts.length === 0) return [];
+  /**
+   * Embed a batch of texts, reporting which model actually produced them.
+   *
+   * The caller must persist the returned `model`, not getEmbeddingModel().
+   * The deterministic local fallback produces vectors that are not comparable
+   * to any real model's, so storing them under the real model's name made
+   * semantic search silently return nonsense: the stored vectors were
+   * character hashes while the query vector came from Cohere, and nothing
+   * anywhere recorded that they were incompatible.
+   */
+  async embedBatchDetailed(texts: string[]): Promise<EmbedBatchResult> {
+    if (texts.length === 0) {
+      return { vectors: [], model: this.embeddingModel, isFallback: false };
+    }
 
     // 1. Prefer Cohere if configured (embed-v4.0 natively outputs 1536-dim embeddings)
     if (this.embeddingProvider === 'cohere' && this.cohereApiKey) {
       try {
-        return await this.embedWithCohere(texts, 'search_document');
+        const vectors = await this.embedWithCohere(texts, 'search_document');
+        return { vectors, model: this.embeddingModel, isFallback: false };
       } catch (err) {
-        this.logger.warn(
-          `Cohere embedding endpoint failed (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
-        );
-        return texts.map((t) => this.generateFallbackEmbedding(t, this.embeddingDimension));
+        return this.fallbackEmbeddings(texts, `Cohere embedding endpoint failed (${String(err)})`);
       }
     }
 
@@ -607,22 +757,60 @@ Respond with valid JSON:
           encoding_format: 'float',
         });
 
-        return response.data
+        const vectors = response.data
           .sort((a, b) => a.index - b.index)
           .map((item) => new Float32Array(item.embedding));
+        return { vectors, model: this.embeddingModel, isFallback: false };
       } catch (err) {
-        this.logger.warn(
-          `OpenAI embedding endpoint unavailable (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
+        return this.fallbackEmbeddings(
+          texts,
+          `OpenAI embedding endpoint unavailable (${String(err)})`,
         );
-        return texts.map((t) => this.generateFallbackEmbedding(t, this.embeddingDimension));
       }
     }
 
     // 3. Deterministic local fallback
-    this.logger.warn(
-      'No remote embedding key configured. Using deterministic 1536-dim semantic feature vector fallback.',
+    return this.fallbackEmbeddings(texts, 'No remote embedding key configured');
+  }
+
+  /**
+   * Back-compat wrapper. Prefer embedBatchDetailed, which also tells you which
+   * model produced the vectors.
+   */
+  async embedBatch(texts: string[]): Promise<Float32Array[]> {
+    const { vectors } = await this.embedBatchDetailed(texts);
+    return vectors;
+  }
+
+  /**
+   * Produce deterministic local vectors as a last resort.
+   *
+   * These are character/trigram hashes, not semantic embeddings: they are
+   * comparable only to other vectors from this same function. Logged at error
+   * level because the document will appear to process successfully while
+   * being effectively unsearchable, and set ALLOW_FALLBACK_EMBEDDINGS=false
+   * to fail the stage instead (the job then retries, giving the provider a
+   * chance to recover).
+   */
+  private fallbackEmbeddings(texts: string[], reason: string): EmbedBatchResult {
+    if (!ALLOW_FALLBACK_EMBEDDINGS) {
+      throw new Error(
+        `EMBEDDING_PROVIDER_UNAVAILABLE: ${reason}. ` +
+        'Refusing to store non-semantic fallback vectors (ALLOW_FALLBACK_EMBEDDINGS=false).',
+      );
+    }
+
+    this.logger.error(
+      `${reason}. Falling back to deterministic ${this.embeddingDimension}-dim hash vectors — ` +
+      'semantic search will not work for these chunks. They are tagged as ' +
+      `"${FALLBACK_EMBEDDING_MODEL}" so they can be found and re-embedded later.`,
     );
-    return texts.map((t) => this.generateFallbackEmbedding(t, this.embeddingDimension));
+
+    return {
+      vectors: texts.map((t) => this.generateFallbackEmbedding(t, this.embeddingDimension)),
+      model: FALLBACK_EMBEDDING_MODEL,
+      isFallback: true,
+    };
   }
 
   /**
@@ -876,6 +1064,59 @@ Respond with valid JSON:
     return schemas[category] ?? schemas['UNKNOWN']!;
   }
 
+  /**
+   * Coerce a model-supplied field type to a valid Prisma FieldType.
+   *
+   * Falls back to inferring from the field name (so a date field still gets
+   * DATE-style normalisation downstream) before settling on TEXT.
+   */
+  private toFieldType(raw: unknown, fieldName: string): ExtractedField['fieldType'] {
+    const normalised = normaliseEnumToken(raw) as ExtractedField['fieldType'];
+    if (FIELD_TYPES.has(normalised)) return normalised;
+
+    // Common model variations that are unambiguous.
+    const aliases: Record<string, ExtractedField['fieldType']> = {
+      STRING: 'TEXT',
+      INT: 'NUMBER',
+      INTEGER: 'NUMBER',
+      FLOAT: 'NUMBER',
+      DECIMAL: 'NUMBER',
+      MONEY: 'CURRENCY',
+      AMOUNT: 'CURRENCY',
+      DATETIME: 'DATE',
+      ARRAY: 'LIST',
+      BOOL: 'BOOLEAN',
+      ID: 'ID_NUMBER',
+      IDNUMBER: 'ID_NUMBER',
+      PERSON: 'NAME',
+    };
+    if (aliases[normalised]) return aliases[normalised]!;
+
+    // Last resort: infer from the schema-defined field name.
+    const name = fieldName.toLowerCase();
+    if (/(^|_)date$|_date$|^date$|validity|expiry/.test(name)) return 'DATE';
+    if (/amount|total|subtotal|balance|ctc|tax|revenue|profit|value|payable/.test(name)) {
+      return 'CURRENCY';
+    }
+    if (/number$|_no$|gstin|pan|ifsc|roll|passport|phone/.test(name)) return 'ID_NUMBER';
+    if (/address/.test(name)) return 'ADDRESS';
+    if (/name$|holder|sender|recipient|parties|auditor/.test(name)) return 'NAME';
+
+    if (raw !== undefined && raw !== null && String(raw).length > 0) {
+      this.logger.debug(
+        `Unrecognised fieldType "${String(raw)}" for field "${fieldName}" — using TEXT`,
+      );
+    }
+    return 'TEXT';
+  }
+
+  /**
+   * Parse a JSON response, tolerating markdown fences.
+   *
+   * A truncated response (the model hitting max_tokens mid-object) lands here
+   * too, so log it: silently returning the fallback made "zero fields
+   * extracted" indistinguishable from "the document genuinely has no fields".
+   */
   private parseJsonSafe<T>(rawContent: string, fallback: T): T {
     try {
       let cleaned = rawContent.trim();
@@ -883,7 +1124,12 @@ Respond with valid JSON:
         cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
       }
       return JSON.parse(cleaned) as T;
-    } catch {
+    } catch (err) {
+      this.logger.warn(
+        `Could not parse LLM JSON response (${String(err)}). ` +
+        `Length=${rawContent.length}, starts="${rawContent.slice(0, 80).replace(/\n/g, ' ')}", ` +
+        `ends="${rawContent.slice(-80).replace(/\n/g, ' ')}". Using fallback.`,
+      );
       return fallback;
     }
   }

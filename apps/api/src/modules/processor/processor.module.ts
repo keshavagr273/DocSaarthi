@@ -45,23 +45,23 @@ const ALL_STAGES = [
 /**
  * ProcessorModule — runs the document processing pipeline inside the API process.
  *
- * Merged from apps/worker so we don't need a separate background worker service.
- * Uses the same Redis queue (DOCUMENT_PROCESSING) that the API enqueues jobs onto.
+ * This is the only consumer of the DOCUMENT_PROCESSING queue. A separate
+ * apps/worker service used to run a second, independently-maintained copy of
+ * these same stages against the same queue and Redis prefix, so each document
+ * was processed by whichever process happened to pick it up — and the two
+ * copies had drifted apart. That app has been removed; this is the single
+ * pipeline.
+ *
  * StorageService is provided globally via StorageModule (@Global).
  * DatabaseService is provided globally via DatabaseModule (@Global).
  */
 @Module({
   imports: [
-    BullModule.registerQueue({
-      name: QUEUES.DOCUMENT_PROCESSING,
-      defaultJobOptions: {
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 5000 },
-        timeout: 600_000, // 10 minutes per job
-        removeOnComplete: { count: 100 },
-        removeOnFail: { count: 200 },
-      },
-    }),
+    // Register by name only. QueueModule owns this queue's defaultJobOptions —
+    // declaring them in both places meant two registrations competing for the
+    // same injection token, so which set of retry/timeout options actually
+    // applied depended on module resolution order.
+    BullModule.registerQueue({ name: QUEUES.DOCUMENT_PROCESSING }),
   ],
   providers: [
     // Services (LLM + OCR client)

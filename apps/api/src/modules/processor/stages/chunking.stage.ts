@@ -9,17 +9,30 @@ const TARGET_CHUNK_MIN_TOKENS = 300;
 const TARGET_CHUNK_MAX_TOKENS = 600;
 
 /**
+ * Hard ceiling for a single chunk. Embedding providers reject oversized
+ * inputs (text-embedding-3-small caps at 8191 tokens), so no chunk may exceed
+ * this no matter how the source text is laid out.
+ */
+const HARD_MAX_CHUNK_TOKENS = 1000;
+
+/** Minimum content length for a chunk to be worth storing. */
+const MIN_CHUNK_CHARS = 20;
+
+/**
  * Stage 12: CHUNKING
  *
  * Splits normalized OCR text into semantically meaningful chunks.
  * Strategy:
- * 1. Split on double newlines (paragraph boundaries)
+ * 1. Split into blocks on blank lines, falling back to single newlines and
+ *    then sentence boundaries when the text has no blank lines at all —
+ *    which is the common case for OCR output and for PDF text-layer
+ *    extraction, where a whole page arrives as one unbroken run of text.
  * 2. Detect headings: ALL-CAPS lines or lines ending with ":"
- * 3. Target chunk size: 300–600 tokens
- * 4. Never split mid-sentence
+ * 3. Target chunk size: 300–600 tokens, hard-capped at HARD_MAX_CHUNK_TOKENS
+ * 4. Prefer sentence boundaries; split on words only as a last resort
  *
- * Uses simple word-based token approximation (~0.75 tokens per word) to avoid
- * shipping the full tiktoken WASM. Can be upgraded to tiktoken in production.
+ * Uses a word-based token approximation to avoid shipping the full tiktoken
+ * WASM. Can be upgraded to tiktoken in production.
  */
 @Injectable()
 export class ChunkingStage extends BaseStage {
@@ -28,6 +41,44 @@ export class ChunkingStage extends BaseStage {
 
   constructor(db: DatabaseService) {
     super(db);
+  }
+
+  /**
+   * Stage 13 embeds ctx.chunks and pairs them positionally with ctx.chunkIds,
+   * so both must come back together and in chunkIndex order.
+   */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.chunkIds && ctx.chunks) return;
+
+    const rows = await this.db.documentChunk.findMany({
+      where: { versionId: ctx.versionId },
+      select: {
+        id: true,
+        chunkIndex: true,
+        content: true,
+        pageNumber: true,
+        sectionTitle: true,
+        tokenCount: true,
+        charCount: true,
+        language: true,
+      },
+      orderBy: { chunkIndex: 'asc' },
+    });
+
+    ctx.chunkIds = rows.map((c) => c.id);
+    ctx.chunks = rows.map((c) => ({
+      chunkIndex: c.chunkIndex,
+      content: c.content,
+      pageNumber: c.pageNumber,
+      sectionTitle: c.sectionTitle ?? undefined,
+      tokenCount: c.tokenCount,
+      charCount: c.charCount,
+      language: c.language ?? undefined,
+    }));
+
+    this.logger.debug(
+      `[${ctx.documentId}] Rehydrated ${ctx.chunkIds.length} chunks (with content) from DB`,
+    );
   }
 
   async execute(
@@ -52,12 +103,28 @@ export class ChunkingStage extends BaseStage {
     const allChunks: DocumentChunkData[] = [];
     let chunkIndex = 0;
 
-    for (const page of ocrResults.sort((a, b) => a.pageNumber - b.pageNumber)) {
+    // Sort a copy — ocrResults is shared via ctx and sorting in place would
+    // reorder it under the stages that read it later.
+    const orderedPages = [...ocrResults].sort((a, b) => a.pageNumber - b.pageNumber);
+
+    for (const page of orderedPages) {
       if (!page.rawText.trim()) continue;
 
       const pageChunks = this.chunkText(page.rawText, page.pageNumber, chunkIndex);
+      // Carry the detected language through so search can filter on it.
+      for (const chunk of pageChunks) {
+        chunk.language = chunk.language ?? page.pageLanguage ?? ctx.primaryLanguage;
+      }
       allChunks.push(...pageChunks);
       chunkIndex += pageChunks.length;
+    }
+
+    if (allChunks.length === 0) {
+      const totalChars = ocrResults.reduce((s, r) => s + r.rawText.length, 0);
+      this.logger.warn(
+        `[${ctx.documentId}] Stage 12: produced 0 chunks from ${ocrResults.length} pages ` +
+        `(${totalChars} OCR chars) — this document will not be searchable`,
+      );
     }
 
     // Bulk insert all chunks in one query instead of N sequential creates
@@ -75,13 +142,21 @@ export class ChunkingStage extends BaseStage {
       })),
     });
 
-    // Retrieve the inserted IDs in order
+    // Retrieve the inserted IDs in chunkIndex order — Stage 13 pairs
+    // ctx.chunks[i] with ctx.chunkIds[i] positionally, so this ordering must
+    // match allChunks exactly.
     const insertedChunks = await this.db.documentChunk.findMany({
       where: { versionId: ctx.versionId },
       orderBy: { chunkIndex: 'asc' },
       select: { id: true },
     });
     const chunkIds = insertedChunks.map((c) => c.id);
+
+    if (chunkIds.length !== allChunks.length) {
+      throw new Error(
+        `CHUNK_PERSIST_MISMATCH: built ${allChunks.length} chunks but read back ${chunkIds.length} for version ${ctx.versionId}`,
+      );
+    }
 
     ctx.chunks = allChunks;
     ctx.chunkIds = chunkIds;
@@ -113,48 +188,67 @@ export class ChunkingStage extends BaseStage {
     pageNumber: number,
     startIndex: number,
   ): DocumentChunkData[] {
-    const paragraphs = text.split(/\n\n+/).map((p) => p.trim()).filter(Boolean);
+    const blocks = this.splitIntoBlocks(text);
     const chunks: DocumentChunkData[] = [];
     let currentContent = '';
     let currentSection: string | undefined;
     let chunkIdx = startIndex;
 
-    const flush = (forceSection?: string) => {
-      const content = currentContent.trim();
-      if (content.length < 20) return; // too short to be meaningful
+    const push = (content: string, sectionTitle?: string) => {
+      const trimmed = content.trim();
+      if (trimmed.length < MIN_CHUNK_CHARS) return; // too short to be meaningful
 
-      const tokenCount = this.estimateTokens(content);
       chunks.push({
         chunkIndex: chunkIdx++,
-        content,
+        content: trimmed,
         pageNumber,
-        sectionTitle: forceSection ?? currentSection,
-        tokenCount,
-        charCount: content.length,
+        sectionTitle,
+        tokenCount: this.estimateTokens(trimmed),
+        charCount: trimmed.length,
       });
-      currentContent = '';
     };
 
-    for (const para of paragraphs) {
-      const isHeading = this.isHeading(para);
+    const flush = () => {
+      const content = currentContent.trim();
+      currentContent = '';
+      if (!content) return;
 
-      if (isHeading) {
+      // A block can be larger than the hard cap on its own (a dense page with
+      // no blank lines, for instance), so enforce the cap here — this is the
+      // last point before the text reaches the embedding provider.
+      for (const piece of this.enforceHardLimit(content)) {
+        push(piece, currentSection);
+      }
+    };
+
+    for (const block of blocks) {
+      if (this.isHeading(block)) {
         // Flush current content before starting new section
         flush();
-        currentSection = para;
+        currentSection = block;
+        // Keep the heading in the body text too. It is often the single most
+        // searchable line on the page (a notice subject, an invoice label),
+        // and a heading consumed only as a section title never reaches the
+        // embeddings or the full-text index.
+        currentContent = block;
         continue;
       }
 
-      const combined = currentContent ? currentContent + '\n\n' + para : para;
+      const combined = currentContent ? currentContent + '\n\n' + block : block;
       const tokens = this.estimateTokens(combined);
 
       if (tokens > TARGET_CHUNK_MAX_TOKENS && currentContent) {
-        // Current chunk is full — flush and start new
+        // Adding this block would overflow — close the current chunk first.
         flush();
-        currentContent = para;
+        currentContent = block;
+        // The block alone may still be over target; flush it immediately so
+        // enforceHardLimit splits it instead of letting it keep growing.
+        if (this.estimateTokens(block) >= TARGET_CHUNK_MAX_TOKENS) {
+          flush();
+        }
       } else {
         currentContent = combined;
-        // Auto-flush when approaching max
+        // Auto-flush once we are within the target band
         if (tokens >= TARGET_CHUNK_MIN_TOKENS) {
           flush();
         }
@@ -168,11 +262,98 @@ export class ChunkingStage extends BaseStage {
   }
 
   /**
-   * Heuristic: a paragraph is a heading if:
-   * - It's a single line
-   * - It's all-caps
-   * - It ends with a colon
-   * - It's < 80 chars
+   * Break page text into candidate blocks.
+   *
+   * Blank lines are the best signal, but OCR output and PDF text-layer
+   * extraction frequently contain none — `rawText` from the PDF path is a
+   * single space-joined run. Splitting only on /\n\n+/ then returned the whole
+   * page as one block, which produced one enormous chunk per page and, on a
+   * dense page, an input the embedding API rejects outright. So fall back
+   * through progressively weaker separators.
+   */
+  private splitIntoBlocks(text: string): string[] {
+    const byBlankLine = text.split(/\n\s*\n+/).map((p) => p.trim()).filter(Boolean);
+    if (byBlankLine.length > 1) return byBlankLine;
+
+    const byLine = text.split(/\n+/).map((p) => p.trim()).filter(Boolean);
+    if (byLine.length > 1) return byLine;
+
+    return this.splitIntoSentences(text);
+  }
+
+  /**
+   * Split on sentence boundaries, including the Devanagari danda (।) used in
+   * Hindi text alongside Western punctuation.
+   */
+  private splitIntoSentences(text: string): string[] {
+    const sentences = text
+      .split(/(?<=[.!?।])\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return sentences.length > 0 ? sentences : [text.trim()].filter(Boolean);
+  }
+
+  /**
+   * Guarantee no piece exceeds HARD_MAX_CHUNK_TOKENS, splitting on sentence
+   * boundaries where possible and on word boundaries only when a single
+   * "sentence" is itself too long (unpunctuated OCR text).
+   */
+  private enforceHardLimit(content: string): string[] {
+    if (this.estimateTokens(content) <= HARD_MAX_CHUNK_TOKENS) return [content];
+
+    const pieces: string[] = [];
+    let buffer = '';
+
+    const flushBuffer = () => {
+      if (buffer.trim()) pieces.push(buffer.trim());
+      buffer = '';
+    };
+
+    for (const sentence of this.splitIntoSentences(content)) {
+      if (this.estimateTokens(sentence) > HARD_MAX_CHUNK_TOKENS) {
+        // Single run of text with no usable punctuation — split by words.
+        flushBuffer();
+        pieces.push(...this.splitByWords(sentence));
+        continue;
+      }
+
+      const candidate = buffer ? `${buffer} ${sentence}` : sentence;
+      if (this.estimateTokens(candidate) > HARD_MAX_CHUNK_TOKENS) {
+        flushBuffer();
+        buffer = sentence;
+      } else {
+        buffer = candidate;
+      }
+    }
+
+    flushBuffer();
+    return pieces.length > 0 ? pieces : [content];
+  }
+
+  private splitByWords(text: string): string[] {
+    const words = text.split(/\s+/).filter(Boolean);
+    // estimateTokens multiplies the word count by 1.3, so invert that to get
+    // the number of words that fits under the cap.
+    const wordsPerChunk = Math.max(1, Math.floor(HARD_MAX_CHUNK_TOKENS / 1.3));
+
+    const pieces: string[] = [];
+    for (let i = 0; i < words.length; i += wordsPerChunk) {
+      pieces.push(words.slice(i, i + wordsPerChunk).join(' '));
+    }
+    return pieces;
+  }
+
+  /**
+   * Heuristic: a block is a heading if it is a single line under 80 chars that
+   * either ends with a colon or is written in all caps.
+   *
+   * The all-caps test must require an actual uppercase letter. The old test
+   * was `line === line.toUpperCase()`, which is true for any string with no
+   * cased characters at all — so every short Devanagari line, and every
+   * date/number line like "12-08-2026", was classified as a heading. Headings
+   * are consumed as section titles rather than emitted as chunk content, so
+   * on a Hindi document (or an ID card, where every line is short) this
+   * dropped most of the text out of the chunks and out of search entirely.
    */
   private isHeading(para: string): boolean {
     const lines = para.split('\n');
@@ -180,8 +361,9 @@ export class ChunkingStage extends BaseStage {
     const line = lines[0]!.trim();
     if (line.length > 80) return false;
     if (line.endsWith(':')) return true;
-    if (line === line.toUpperCase() && line.length > 3) return true;
-    return false;
+    const hasUpper = /\p{Lu}/u.test(line);
+    const hasLower = /\p{Ll}/u.test(line);
+    return line.length > 3 && hasUpper && !hasLower;
   }
 
   /**

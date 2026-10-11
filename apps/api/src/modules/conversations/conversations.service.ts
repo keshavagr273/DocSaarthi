@@ -28,7 +28,7 @@ export class ConversationsService {
       apiKey: process.env['OPENAI_API_KEY'] ?? '',
       baseURL: process.env['OPENAI_BASE_URL'] || undefined,
     });
-    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'groq/llama3-8b-8192';
+    this.chatModel = process.env['DEFAULT_LLM_MODEL'] ?? 'openai/gpt-oss-120b';
   }
 
   // ── Conversation Management ───────────────────────────────────────
@@ -241,7 +241,7 @@ export class ConversationsService {
     );
 
     // 3. Build RAG Context & Prompt
-    const formattedContext = this.buildContext(retrievedChunks);
+    const formattedContext = await this.buildContext(retrievedChunks);
     const systemPrompt = this.buildSystemPrompt(queryLang, conversation.document?.title);
 
     const historyMessages = conversation.messages.reverse().map((m: (typeof conversation.messages)[number]) => ({
@@ -267,6 +267,14 @@ export class ConversationsService {
 
       let completeAnswer = '';
 
+      // Stop generating if the client goes away. Without this the upstream
+      // completion kept streaming (and kept being billed) after the browser
+      // had disconnected, and every res.write() threw on a closed socket.
+      let clientGone = false;
+      res.on('close', () => {
+        clientGone = true;
+      });
+
       try {
         const stream = await this.openai.chat.completions.create({
           model: this.chatModel,
@@ -277,6 +285,13 @@ export class ConversationsService {
         });
 
         for await (const chunk of stream) {
+          if (clientGone) {
+            this.logger.log(
+              `Client disconnected mid-stream for conversation ${conversationId} — aborting generation`,
+            );
+            await stream.controller.abort();
+            break;
+          }
           const delta = chunk.choices[0]?.delta?.content ?? '';
           if (delta) {
             completeAnswer += delta;
@@ -300,8 +315,8 @@ export class ConversationsService {
           },
         });
 
-        // Link citations to message in DB
-        await this.persistCitations(assistantMessage.id, retrievedChunks);
+        // Link the citations the answer actually used to the message
+        await this.persistCitations(assistantMessage.id, citations, retrievedChunks);
 
         // Update conversation timestamp & title if first message
         await this.db.conversation.update({
@@ -312,11 +327,16 @@ export class ConversationsService {
           },
         });
 
-        res.write(`data: ${JSON.stringify({ type: 'done', citations, messageId: assistantMessage.id })}\n\n`);
-        res.end();
+        if (!clientGone && !res.writableEnded) {
+          res.write(`data: ${JSON.stringify({ type: 'done', citations, messageId: assistantMessage.id })}\n\n`);
+          res.end();
+        }
         return;
       } catch (err) {
         this.logger.error(`SSE Streaming failed: ${String(err)}`);
+        // Writing to an already-closed socket throws, which would turn a
+        // handled failure into an unhandled rejection.
+        if (clientGone || res.writableEnded) return;
         res.write(`data: ${JSON.stringify({ type: 'error', message: 'Failed to generate response' })}\n\n`);
         res.end();
         return;
@@ -342,7 +362,7 @@ export class ConversationsService {
         },
       });
 
-      await this.persistCitations(assistantMessage.id, retrievedChunks);
+      await this.persistCitations(assistantMessage.id, citations, retrievedChunks);
 
       return {
         userMessage,
@@ -382,15 +402,36 @@ CRITICAL RULES:
 5. Be concise, structured, and factual.`;
   }
 
-  private buildContext(chunks: SearchResultItem[]): string {
+  /**
+   * Build the RAG context from the FULL text of each retrieved chunk.
+   *
+   * This used to use `c.snippet`, which is a ~200-character highlight window
+   * built for the search UI. The model therefore saw a fragment of each chunk
+   * rather than the chunk, and any fact outside that window was invisible —
+   * a notice whose chunk plainly contained "Last Date for Submission:
+   * 15-09-2026" still produced "I could not find this information in your
+   * documents", because the deadline fell outside the snippet window.
+   */
+  private async buildContext(chunks: SearchResultItem[]): Promise<string> {
     if (chunks.length === 0) {
       return 'No relevant document context found.';
     }
 
+    const rows = await this.db.documentChunk.findMany({
+      where: { id: { in: chunks.map((c) => c.chunkId) } },
+      select: { id: true, content: true },
+    });
+    const contentById = new Map(rows.map((r) => [r.id, r.content]));
+
     return chunks
       .map((c, idx) => {
         const sec = c.sectionTitle ? ` Section: ${c.sectionTitle},` : '';
-        return `[Source ${idx + 1}: ${c.documentTitle}, Page ${c.pageNumber},${sec} Category: ${c.documentCategory ?? 'General'}]\n${c.snippet.replace(/\*\*/g, '')}`;
+        // Fall back to the snippet only if the chunk has since been deleted.
+        const body = contentById.get(c.chunkId) ?? c.snippet;
+        return (
+          `[Source ${idx + 1}: ${c.documentTitle}, Page ${c.pageNumber},${sec} ` +
+          `Category: ${c.documentCategory ?? 'General'}]\n${body.replace(/\*\*/g, '')}`
+        );
       })
       .join('\n\n');
   }
@@ -454,36 +495,63 @@ CRITICAL RULES:
     return this.matchCitations(answer, retrievedChunks);
   }
 
+  /**
+   * Persist the citations the answer actually used.
+   *
+   * This previously stored the top 3 *retrieved* chunks regardless of what
+   * the answer cited, so the citations saved to the DB differed from the ones
+   * returned to the caller — reopening a conversation showed a different set
+   * of sources than the live response had.
+   */
   private async persistCitations(
     messageId: string,
+    citations: CitationItem[],
     retrievedChunks: SearchResultItem[],
   ): Promise<void> {
-    const topChunks = retrievedChunks.slice(0, 3);
+    if (citations.length === 0) return;
 
-    for (const chunk of topChunks) {
-      try {
-        const version = await this.db.documentVersion.findFirst({
-          where: { documentId: chunk.documentId },
-          orderBy: { versionNumber: 'desc' },
-          select: { id: true },
-        });
+    const scoreByChunk = new Map(retrievedChunks.map((c) => [c.chunkId, c.finalScore]));
 
-        if (version) {
-          await this.db.citation.create({
-            data: {
-              messageId,
-              chunkId: chunk.chunkId,
-              documentId: chunk.documentId,
-              versionId: version.id,
-              pageNumber: chunk.pageNumber,
-              sectionTitle: chunk.sectionTitle,
-              relevanceScore: chunk.finalScore,
-            },
-          });
+    // Resolve each chunk's own version. Looking up the document's newest
+    // version instead pointed the citation at a version the chunk is not
+    // part of, so the page number referred to a different page once a second
+    // version had been uploaded.
+    const chunkIds = citations.map((c) => c.chunkId);
+    const chunks = await this.db.documentChunk.findMany({
+      where: { id: { in: chunkIds } },
+      select: { id: true, versionId: true },
+    });
+    const versionByChunk = new Map(chunks.map((c) => [c.id, c.versionId]));
+
+    const rows = citations
+      .map((citation) => {
+        const versionId = versionByChunk.get(citation.chunkId);
+        if (!versionId) {
+          this.logger.warn(
+            `Skipping citation for chunk ${citation.chunkId} — chunk no longer exists`,
+          );
+          return null;
         }
-      } catch (err) {
-        this.logger.warn(`Failed to persist citation: ${String(err)}`);
-      }
+        return {
+          messageId,
+          chunkId: citation.chunkId,
+          documentId: citation.documentId,
+          versionId,
+          pageNumber: citation.pageNumber,
+          sectionTitle: citation.sectionTitle,
+          relevanceScore: scoreByChunk.get(citation.chunkId) ?? null,
+        };
+      })
+      .filter((row): row is NonNullable<typeof row> => row !== null);
+
+    if (rows.length === 0) return;
+
+    try {
+      await this.db.citation.createMany({ data: rows });
+    } catch (err) {
+      // Citations are supplementary — a failure here must not discard the
+      // assistant message that was already generated and saved.
+      this.logger.warn(`Failed to persist citations for message ${messageId}: ${String(err)}`);
     }
   }
 }

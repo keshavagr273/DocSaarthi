@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import OpenAI from 'openai';
 import { DatabaseService, Prisma } from '@docsaarthi/database';
 import { SearchQueryDto } from './dto/search.dto';
+import { FALLBACK_EMBEDDING_MODEL } from '../processor/services/llm.service';
 
 export interface SearchResultItem {
   chunkId: string;
@@ -31,6 +32,12 @@ export class SearchService {
   private readonly cohereApiKey?: string;
   private readonly embeddingProvider: string;
   private readonly embeddingModel: string;
+  /**
+   * Must match LlmService's dimension — the hash fallback was hard-coded to
+   * 1536 here, so a deployment with a different EMBEDDING_DIMENSION produced
+   * a query vector of the wrong width and every semantic search failed.
+   */
+  private readonly embeddingDimension: number;
 
   constructor(private readonly db: DatabaseService) {
     this.openai = new OpenAI({
@@ -46,6 +53,7 @@ export class SearchService {
     this.embeddingModel =
       process.env['DEFAULT_EMBEDDING_MODEL'] ??
       (this.embeddingProvider === 'cohere' ? 'embed-v4.0' : 'text-embedding-3-small');
+    this.embeddingDimension = Number(process.env['EMBEDDING_DIMENSION'] ?? 1536);
   }
 
   // ── Unified Search Entry Point ────────────────────────────────────
@@ -83,9 +91,10 @@ export class SearchService {
     filters: Partial<SearchQueryDto>,
     limit = 10,
   ): Promise<SearchResultItem[]> {
-    const embedding = await this.generateQueryEmbedding(query);
-    if (!embedding) return [];
+    const queryEmbedding = await this.generateQueryEmbedding(query);
+    if (!queryEmbedding) return [];
 
+    const { embedding, model: queryModel } = queryEmbedding;
     const vectorString = `[${Array.from(embedding).join(',')}]`;
 
     // Dynamic filter clauses
@@ -131,10 +140,17 @@ export class SearchService {
         FROM document_embeddings de
         JOIN document_chunks dc ON de."chunkId" = dc.id
         JOIN documents d ON dc."documentId" = d.id
-        WHERE 1=1 ${docFilter}
+        WHERE de.model = ${queryModel} ${docFilter}
         ORDER BY de.embedding <=> ${vectorString}::vector ASC
         LIMIT ${limit};
       `;
+
+      if (rows.length === 0) {
+        // Distinguish "nothing matched" from "nothing is comparable". Vectors
+        // from different models are not comparable at all, so without the
+        // model filter above this returned confidently-ranked nonsense.
+        await this.warnOnModelMismatch(userId, queryModel);
+      }
 
       return rows.map((r) => ({
         chunkId: r.chunk_id,
@@ -213,7 +229,18 @@ export class SearchService {
             CASE WHEN dc.content ILIKE ${'%' + cleanQuery + '%'} THEN 0.95 ELSE 0 END,
             ts_rank(to_tsvector('english', dc.content), plainto_tsquery('english', ${cleanQuery})) * 1.5,
             ts_rank(to_tsvector('english', dc.content), websearch_to_tsquery('english', ${cleanQuery})) * 1.2,
-            0.15
+            -- Partial-match floor, scaled by how many query words the chunk
+            -- actually contains. This was a flat 0.15, so every row that
+            -- matched a single word scored identically and the ordering of
+            -- partial matches was arbitrary — a chunk containing all but one
+            -- term ranked no higher than one containing just one term. Hindi
+            -- and other non-English text relies on this path entirely, since
+            -- the 'english' text-search config does not stem it.
+            (
+              SELECT 0.10 + 0.35 * (COUNT(*)::float / GREATEST(array_length(${searchWords}::text[], 1), 1))
+              FROM unnest(${searchWords}::text[]) w
+              WHERE dc.content ILIKE '%' || w || '%'
+            )
           ) AS keyword_score
         FROM document_chunks dc
         JOIN documents d ON dc."documentId" = d.id
@@ -303,7 +330,16 @@ export class SearchService {
 
   // ── Helper: Query Embedding ───────────────────────────────────────
 
-  async generateQueryEmbedding(query: string): Promise<Float32Array | null> {
+  /**
+   * Embed the query, reporting which model produced the vector.
+   *
+   * The model matters: executeSemanticSearch filters stored rows to the same
+   * model, because vectors from two different models are not comparable and
+   * comparing them produces confidently-ranked noise.
+   */
+  async generateQueryEmbedding(
+    query: string,
+  ): Promise<{ embedding: Float32Array; model: string } | null> {
     const cleanQuery = query.trim() || ' ';
 
     // 1. Prefer Cohere if configured
@@ -333,12 +369,17 @@ export class SearchService {
           embeddings?: { float?: number[][] };
         };
         const embedding = data.embeddings?.float?.[0];
-        return embedding ? new Float32Array(embedding) : null;
+        return embedding
+          ? { embedding: new Float32Array(embedding), model: this.embeddingModel }
+          : null;
       } catch (err) {
         this.logger.warn(
-          `Cohere query embedding failed (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
+          `Cohere query embedding failed (${String(err)}). Using the deterministic hash fallback.`,
         );
-        return this.generateFallbackEmbedding(cleanQuery);
+        return {
+          embedding: this.generateFallbackEmbedding(cleanQuery, this.embeddingDimension),
+          model: FALLBACK_EMBEDDING_MODEL,
+        };
       }
     }
 
@@ -350,12 +391,46 @@ export class SearchService {
         encoding_format: 'float',
       });
       const embedding = response.data[0]?.embedding;
-      return embedding ? new Float32Array(embedding) : null;
+      return embedding
+        ? { embedding: new Float32Array(embedding), model: this.embeddingModel }
+        : null;
     } catch (err) {
       this.logger.warn(
-        `Remote query embedding unavailable (${String(err)}). Using deterministic 1536-dim semantic feature vector fallback.`,
+        `Remote query embedding unavailable (${String(err)}). Using the deterministic hash fallback.`,
       );
-      return this.generateFallbackEmbedding(cleanQuery);
+      return {
+        embedding: this.generateFallbackEmbedding(cleanQuery, this.embeddingDimension),
+        model: FALLBACK_EMBEDDING_MODEL,
+      };
+    }
+  }
+
+  /**
+   * When a semantic search returns nothing, check whether the user has
+   * embeddings stored under a different model and say so. Otherwise an
+   * embedding-provider change (or an outage that stored hash fallbacks) looks
+   * exactly like "this user has no matching documents".
+   */
+  private async warnOnModelMismatch(userId: string, queryModel: string): Promise<void> {
+    try {
+      const rows = await this.db.$queryRaw<Array<{ model: string; count: bigint }>>`
+        SELECT de.model, COUNT(*) AS count
+        FROM document_embeddings de
+        JOIN documents d ON de."documentId" = d.id
+        WHERE d."userId" = ${userId} AND d."isDeleted" = false
+        GROUP BY de.model
+      `;
+
+      const otherModels = rows.filter((r) => r.model !== queryModel);
+      if (otherModels.length > 0) {
+        this.logger.warn(
+          `Semantic search found no rows for model "${queryModel}", but this user has ` +
+          otherModels.map((r) => `${Number(r.count)} under "${r.model}"`).join(', ') +
+          '. Those embeddings must be regenerated with the current provider to be searchable.',
+        );
+      }
+    } catch {
+      // Diagnostics only — never fail a search because of this.
     }
   }
 

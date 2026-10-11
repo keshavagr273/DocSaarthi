@@ -361,6 +361,11 @@ DELETE /api/v1/documents/:id         ← Soft delete
 
 **Separate NestJS application** (`apps/worker/`) that runs as its own process.
 
+> **Superseded:** this was built as planned and later removed. The pipeline now
+> runs inside the API process (`apps/api/src/modules/processor`). See
+> `docs/architecture.md` for why. The rest of this section describes the
+> original plan and is kept for history.
+
 **What to configure:**
 - BullMQ connected to same Redis instance as API
 - Register queue: `document-processing` (the only queue needed for Checkpoint 1)
@@ -1850,7 +1855,7 @@ Key differences from dev:
 **Dockerfiles (all apps):**
 - Multi-stage builds: build stage + slim production stage
 - `apps/api/Dockerfile`: Build → `node:20-alpine`, copy only dist + node_modules (pruned)
-- `apps/worker/Dockerfile`: Same pattern as API
+- `apps/worker/Dockerfile`: Same pattern as API *(removed — no worker app)*
 - `apps/web/Dockerfile`: Build → standalone Next.js output → `node:20-alpine`
 - `.dockerignore`: exclude src, tests, docs, local node_modules
 

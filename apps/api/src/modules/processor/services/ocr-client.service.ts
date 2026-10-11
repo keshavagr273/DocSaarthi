@@ -29,14 +29,30 @@ interface PaddleOcrResponse {
  *
  * Falls back to extracting embedded PDF text when the sidecar is unavailable.
  */
+/**
+ * How long to stop calling the sidecar after it times out or errors.
+ *
+ * Without this, a sidecar that hangs rather than refusing connections cost a
+ * full timeoutMs per page. On a 50-page document that is 50 x 2 minutes — far
+ * past the 10-minute job timeout — so the job was killed mid-pipeline and
+ * retried, three times, before the document was finally marked failed. One
+ * failure now trips the breaker and the remaining pages fall straight through
+ * to the VLM/Tesseract path.
+ */
+const CIRCUIT_OPEN_MS = Number(process.env['OCR_CIRCUIT_OPEN_MS'] ?? 60_000);
+
 @Injectable()
 export class OcrClientService {
   private readonly logger = new Logger(OcrClientService.name);
   private readonly baseUrl: string;
-  private readonly timeoutMs = 120_000; // 2 minutes per page
+  private readonly timeoutMs: number;
+
+  /** Epoch ms until which the sidecar is considered unavailable. */
+  private circuitOpenUntil = 0;
 
   constructor() {
     this.baseUrl = process.env['OCR_PADDLE_URL'] ?? 'http://localhost:8081';
+    this.timeoutMs = Number(process.env['OCR_PADDLE_TIMEOUT_MS'] ?? 120_000);
   }
 
   /**
@@ -47,6 +63,14 @@ export class OcrClientService {
     imageBuffer: Buffer,
     pageNumber: number,
   ): Promise<OcrPageResult> {
+    if (Date.now() < this.circuitOpenUntil) {
+      const secondsLeft = Math.ceil((this.circuitOpenUntil - Date.now()) / 1000);
+      this.logger.debug(
+        `Skipping PaddleOCR for page ${pageNumber} — sidecar marked down for another ${secondsLeft}s`,
+      );
+      return this.fallbackOcr(imageBuffer, pageNumber);
+    }
+
     try {
       const imageBase64 = imageBuffer.toString('base64');
 
@@ -61,41 +85,56 @@ export class OcrClientService {
 
       const data = response.data;
 
-      const blocks: OcrBlock[] = data.blocks.map((b) => ({
-        id: b.id,
-        text: b.text,
+      // A malformed or partial response would otherwise throw on
+      // `data.blocks.map` and be reported as "sidecar unavailable".
+      const rawBlocks = Array.isArray(data?.blocks) ? data.blocks : [];
+
+      const blocks: OcrBlock[] = rawBlocks.map((b, idx) => ({
+        id: b.id ?? `paddle-${pageNumber}-${idx}`,
+        text: b.text ?? '',
         bbox: b.bbox,
-        confidence: b.confidence,
-        readingOrder: b.reading_order,
-        blockType: b.block_type,
+        confidence: typeof b.confidence === 'number' ? b.confidence : 0,
+        readingOrder: typeof b.reading_order === 'number' ? b.reading_order : idx,
+        blockType: b.block_type ?? 'text',
       }));
 
+      // The sidecar answered — close the breaker if it was open.
+      this.circuitOpenUntil = 0;
+
       return {
-        pageNumber: data.page_number,
-        width: data.width,
-        height: data.height,
+        // Trust our own page number over the echoed one: a mismatch would
+        // write the OCR row against the wrong page.
+        pageNumber,
+        width: data?.width ?? 0,
+        height: data?.height ?? 0,
         blocks,
-        rawText: data.raw_text,
-        pageConfidence: data.page_confidence,
-        pageLanguage: data.page_language,
-        processingTimeMs: data.processing_time_ms,
+        rawText: data?.raw_text ?? '',
+        pageConfidence: typeof data?.page_confidence === 'number' ? data.page_confidence : 0,
+        pageLanguage: data?.page_language ?? 'unknown',
+        processingTimeMs: data?.processing_time_ms ?? 0,
         fallbackUsed: false,
+        provider: 'paddle',
       };
     } catch (err) {
+      this.circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
       this.logger.warn(
-        `PaddleOCR sidecar unavailable for page ${pageNumber}: ${String(err)}. Using fallback.`,
+        `PaddleOCR sidecar unavailable for page ${pageNumber}: ${String(err)}. ` +
+        `Using fallback and skipping the sidecar for ${Math.round(CIRCUIT_OPEN_MS / 1000)}s.`,
       );
       return this.fallbackOcr(imageBuffer, pageNumber);
     }
   }
 
   /**
-   * Check if the sidecar is reachable.
+   * Check if the sidecar is reachable. Also resets the breaker on success, so
+   * a health check can bring the sidecar back early.
    */
   async isAvailable(): Promise<boolean> {
     try {
       const res = await axios.get(`${this.baseUrl}/health`, { timeout: 5000 });
-      return res.status === 200;
+      const up = res.status === 200;
+      if (up) this.circuitOpenUntil = 0;
+      return up;
     } catch {
       return false;
     }
@@ -121,6 +160,7 @@ export class OcrClientService {
       pageLanguage: 'unknown',
       processingTimeMs: 0,
       fallbackUsed: true,
+      provider: 'none',
     };
   }
 }

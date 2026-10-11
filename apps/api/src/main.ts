@@ -14,6 +14,12 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule);
 
+  // Required for onModuleDestroy to run on SIGTERM/SIGINT. Without it, a
+  // redeploy killed the process with the Bull consumer, the Prisma pool and
+  // the Tesseract worker still live — in-flight jobs were lost mid-stage
+  // rather than being released back to the queue.
+  app.enableShutdownHooks();
+
   const config = app.get(ConfigService);
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : config.get<number>('PORT', 3001);
   const corsOrigin = config.get<string>('CORS_ORIGIN', '*');

@@ -9,7 +9,7 @@ import { Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { Job } from 'bull';
 import { DatabaseService, ProcessingStatus, ProcessingStage, DocumentStatus } from '@docsaarthi/database';
 import { QUEUES, JOBS } from '@docsaarthi/shared';
-import { createPipelineContext, type PipelineContext, type OcrBlock, type DocumentProcessingJobData } from './stages/pipeline-context';
+import { createPipelineContext, type DocumentProcessingJobData } from './stages/pipeline-context';
 
 // ── Stage imports ───────────────────────────────────────────────────
 import { FileValidationStage } from './stages/file-validation.stage';
@@ -26,7 +26,7 @@ import { ValidationStage } from './stages/validation.stage';
 import { ChunkingStage } from './stages/chunking.stage';
 import { EmbeddingStage } from './stages/embedding.stage';
 import { IndexingStage } from './stages/indexing.stage';
-import type { BaseStage } from './stages/base.stage';
+import { BaseStage } from './stages/base.stage';
 export type { DocumentProcessingJobData };
 
 /**
@@ -86,14 +86,24 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
 
   @OnQueueFailed()
   async onFailed(job: Job<DocumentProcessingJobData>, err: Error): Promise<void> {
+    const maxAttempts = job.opts.attempts ?? 1;
     this.logger.error(
-      `[Job ${job.id}] FAILED — document=${job.data.documentId} error=${err.message}`,
+      `[Job ${job.id}] FAILED — document=${job.data.documentId} ` +
+      `attempt=${job.attemptsMade}/${maxAttempts} error=${err.message}`,
       err.stack,
     );
 
-    const isLastAttempt = job.attemptsMade >= (job.opts.attempts ?? 3) - 1;
-    if (isLastAttempt) {
+    // Bull increments attemptsMade before emitting 'failed', so attemptsMade
+    // already counts this attempt. The previous `>= attempts - 1` comparison
+    // marked the document FAILED one attempt early, before the final retry had
+    // even run — so a document that would have succeeded on retry was shown to
+    // the user as failed.
+    if (job.attemptsMade >= maxAttempts) {
       await this.markDocumentFailed(job.data, err);
+    } else {
+      this.logger.log(
+        `[Job ${job.id}] will be retried (${job.attemptsMade}/${maxAttempts} attempts used)`,
+      );
     }
   }
 
@@ -168,22 +178,24 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
       for (let i = 0; i < pipeline.length; i++) {
         const stage = pipeline[i]!;
 
+        const stageLabel = stage.name;
+
         // Idempotency: skip stages already completed on a prior attempt
         const alreadyDone = await stage.isAlreadyCompleted(ctx);
         if (alreadyDone) {
           this.logger.debug(
-            `[${documentId}] Skipping already-completed stage ${i + 1}/${totalStages}`,
+            `[${documentId}] Skipping already-completed stage ${i + 1}/${totalStages} (${stageLabel})`,
           );
 
           // ── Context rehydration from DB ─────────────────────────
-          // When a stage is skipped, its in-memory results are missing.
-          // We must reload persisted data so downstream stages have context.
-          await this.rehydrateContextForSkippedStage(ctx, stage, pipeline);
+          // A skipped stage left nothing in memory, so each stage restores its
+          // own persisted output. Stages run in order, so a stage's rehydrate()
+          // can rely on earlier stages' ctx fields already being present.
+          await stage.rehydrate(ctx);
 
           continue;
         }
 
-        const stageLabel = (stage as unknown as { stageName?: string }).stageName ?? stage.constructor.name;
         this.logger.log(`\n${'─'.repeat(60)}\n▶ [${i + 1}/${totalStages}] ${stageLabel} — STARTING\n${'─'.repeat(60)}`);
 
         const t0 = Date.now();
@@ -199,6 +211,11 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
       }
 
       // ── Mark as COMPLETED ───────────────────────────────────────
+      // Stage markers are written fire-and-forget for speed. Let them settle
+      // before the COMPLETED write below, otherwise a late marker can land
+      // afterwards and overwrite processingStage back to an earlier stage.
+      await BaseStage.flushHistory(ctx);
+
       const now = new Date();
       const version = await this.db.documentVersion.findUnique({
         where: { id: versionId },
@@ -272,113 +289,6 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ── Context rehydration from DB ─────────────────────────────────
-
-  /**
-   * When a stage is already completed and skipped on retry, reload its persisted
-   * results back into ctx so that downstream stages have the data they need.
-   */
-  private async rehydrateContextForSkippedStage(
-    ctx: PipelineContext,
-    stage: BaseStage,
-    pipeline: BaseStage[],
-  ): Promise<void> {
-    const { documentId, versionId } = ctx;
-
-    // Determine which stage this is by index
-    const stageIdx = pipeline.indexOf(stage);
-
-    // Stage 2 (index 1): FILE_STORAGE — thumbnail key stored in documentVersion
-    if (stageIdx === 1 && !ctx.thumbnailStorageKey) {
-      const version = await this.db.documentVersion.findUnique({
-        where: { id: versionId },
-        select: { thumbnailStorageKey: true },
-      });
-      if (version?.thumbnailStorageKey) {
-        ctx.thumbnailStorageKey = version.thumbnailStorageKey;
-      }
-    }
-
-    // Stage 2 (index 2): PDF_RENDERING — pageIds from documentPages
-    if (stageIdx === 2 && !ctx.pageIds) {
-      const pages = await this.db.documentPage.findMany({
-        where: { versionId },
-        select: { id: true, pageNumber: true, storageKey: true },
-        orderBy: { pageNumber: 'asc' },
-      });
-      ctx.pageIds = {};
-      ctx.pageStorageKeys = {};
-      for (const p of pages) {
-        ctx.pageIds[p.pageNumber] = p.id;
-        ctx.pageStorageKeys[p.pageNumber] = p.storageKey;
-      }
-      this.logger.debug(`[${documentId}] Rehydrated ${pages.length} page IDs from DB`);
-    }
-
-    // Stage 4 (index 4): OCR — ocrResults from ocrResult table
-    if (stageIdx === 4 && !ctx.ocrResults) {
-      const ocrRows = await this.db.ocrResult.findMany({
-        where: { versionId },
-        orderBy: { pageNumber: 'asc' },
-      });
-      ctx.ocrResults = ocrRows.map((row) => ({
-        pageNumber: row.pageNumber,
-        width: 0,
-        height: 0,
-        blocks: Array.isArray(row.blocks) ? (row.blocks as unknown as OcrBlock[]) : [],
-        rawText: row.rawText ?? '',
-        pageConfidence: row.pageConfidence ?? 0,
-        pageLanguage: row.pageLanguage ?? 'en',
-        processingTimeMs: row.processingTimeMs ?? 0,
-        fallbackUsed: row.fallbackUsed ?? false,
-      }));
-      this.logger.debug(
-        `[${documentId}] Rehydrated ${ctx.ocrResults.length} OCR pages from DB`,
-      );
-    }
-
-    // Stage 5 (index 5): LANGUAGE_DETECTION — derive from already-rehydrated ocrResults
-    if (stageIdx === 5 && !ctx.primaryLanguage) {
-      // Language is stored in ocrResult rows; derive from most common pageLanguage
-      if (ctx.ocrResults && ctx.ocrResults.length > 0) {
-        ctx.primaryLanguage = ctx.ocrResults[0]?.pageLanguage ?? 'en';
-      } else {
-        ctx.primaryLanguage = 'en';
-      }
-    }
-
-    // Stage 11 (index 11): CHUNKING — chunkIds + full chunks from documentChunks
-    if (stageIdx === 11 && !ctx.chunkIds) {
-      const chunkRows = await this.db.documentChunk.findMany({
-        where: { versionId },
-        select: {
-          id: true,
-          chunkIndex: true,
-          content: true,
-          pageNumber: true,
-          sectionTitle: true,
-          tokenCount: true,
-          charCount: true,
-          language: true,
-        },
-        orderBy: { chunkIndex: 'asc' },
-      });
-      ctx.chunkIds = chunkRows.map((c) => c.id);
-      ctx.chunks = chunkRows.map((c) => ({
-        chunkIndex: c.chunkIndex,
-        content: c.content,
-        pageNumber: c.pageNumber,
-        sectionTitle: c.sectionTitle ?? undefined,
-        tokenCount: c.tokenCount,
-        charCount: c.charCount,
-        language: c.language ?? undefined,
-      }));
-      this.logger.debug(
-        `[${documentId}] Rehydrated ${ctx.chunkIds.length} chunks (with content) from DB`,
-      );
-    }
-  }
-
   // ── Failure handler ──────────────────────────────────────────────
 
   private async markDocumentFailed(
@@ -388,29 +298,51 @@ export class DocumentProcessor implements OnModuleInit, OnModuleDestroy {
     const { documentId, versionId } = data;
     const now = new Date();
 
-    await Promise.all([
-      this.db.document.update({
-        where: { id: documentId },
-        data: { status: DocumentStatus.FAILED },
-      }),
-      this.db.documentVersion.update({
-        where: { id: versionId },
-        data: {
-          processingStatus: ProcessingStatus.FAILED,
-          processingError: error.message,
-          processingErrorStack: error.stack,
-          completedAt: now,
-        },
-      }),
-      this.db.processingJob.updateMany({
-        where: { documentId, versionId },
-        data: {
-          status: ProcessingStatus.FAILED,
-          errorMessage: error.message,
-          errorStack: error.stack,
-          completedAt: now,
-        },
-      }),
-    ]);
+    // updateMany (not update) so a document or version that was deleted while
+    // the job was in flight does not throw P2025 out of the 'failed' event
+    // handler, where nothing would catch it. Each write is independent: one
+    // failing must not stop the others from recording the error.
+    const writes: Array<[string, Promise<unknown>]> = [
+      [
+        'document',
+        this.db.document.updateMany({
+          where: { id: documentId },
+          data: { status: DocumentStatus.FAILED },
+        }),
+      ],
+      [
+        'documentVersion',
+        this.db.documentVersion.updateMany({
+          where: { id: versionId },
+          data: {
+            processingStatus: ProcessingStatus.FAILED,
+            processingError: error.message.slice(0, 2000),
+            processingErrorStack: error.stack,
+            completedAt: now,
+          },
+        }),
+      ],
+      [
+        'processingJob',
+        this.db.processingJob.updateMany({
+          where: { documentId, versionId },
+          data: {
+            status: ProcessingStatus.FAILED,
+            errorMessage: error.message.slice(0, 2000),
+            errorStack: error.stack,
+            completedAt: now,
+          },
+        }),
+      ],
+    ];
+
+    const results = await Promise.allSettled(writes.map(([, p]) => p));
+    results.forEach((result, idx) => {
+      if (result.status === 'rejected') {
+        this.logger.error(
+          `Could not record failure state on ${writes[idx]![0]} for document=${documentId}: ${String(result.reason)}`,
+        );
+      }
+    });
   }
 }

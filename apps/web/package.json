@@ -22,9 +22,7 @@
     "react-hot-toast": "^2.4.1",
     "lucide-react": "^0.400.0",
     "clsx": "^2.1.1",
-    "tailwind-merge": "^2.4.0",
-    "framer-motion": "^11.3.0",
-    "date-fns": "^3.6.0"
+    "tailwind-merge": "^2.4.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

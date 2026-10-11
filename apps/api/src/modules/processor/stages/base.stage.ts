@@ -36,6 +36,23 @@ export abstract class BaseStage {
     job: Job<DocumentProcessingJobData>,
   ): Promise<void>;
 
+  /**
+   * Restore into ctx whatever this stage would have written, for the case
+   * where it is skipped as already-completed on a retry.
+   *
+   * Every stage that writes a ctx field consumed by a *later* stage MUST
+   * implement this, otherwise the retry runs the downstream stages against an
+   * empty context and silently produces wrong results (e.g. STRUCTURED_
+   * EXTRACTION reading `ctx.normalizedText === undefined` and extracting
+   * nothing). Declaring it is mandatory so a new stage cannot forget.
+   */
+  abstract rehydrate(ctx: PipelineContext): Promise<void>;
+
+  /** Human-readable stage name, for logs and the pipeline summary table. */
+  get name(): ProcessingStage {
+    return this.stageName;
+  }
+
   // ── Stage history helpers ─────────────────────────────────────
 
   protected markStageProcessing(versionId: string, ctx?: PipelineContext): void {
@@ -117,8 +134,11 @@ export abstract class BaseStage {
     let historyToWrite: HistoryEntry[];
 
     if (ctx?.stageHistory) {
-      // We already have the full in-memory history — write it directly (no read needed)
-      historyToWrite = ctx.stageHistory;
+      // We already have the full in-memory history — write it directly (no read
+      // needed). Snapshot it: the marker writes are fire-and-forget, so without
+      // a copy two in-flight writes would share one mutating array and the
+      // later-resolving one could persist a stale, shorter history.
+      historyToWrite = [...ctx.stageHistory];
     } else {
       // Cold path: fetch from DB (only happens if ctx not passed, e.g. legacy calls)
       const version = await this.db.documentVersion.findUnique({
@@ -136,18 +156,43 @@ export abstract class BaseStage {
       historyToWrite = filtered;
     }
 
-    await this.db.documentVersion.update({
-      where: { id: versionId },
-      data: {
-        stageHistory: historyToWrite,
-        // Also update the current stage field (used for UI)
-        ...(entry.status === 'PROCESSING' ? { processingStage: this.stageName } : {}),
-      },
-    });
+    const write = async (): Promise<void> => {
+      await this.db.documentVersion.update({
+        where: { id: versionId },
+        data: {
+          stageHistory: historyToWrite,
+          // Also update the current stage field (used for UI)
+          ...(entry.status === 'PROCESSING' ? { processingStage: this.stageName } : {}),
+        },
+      });
+    };
+
+    if (!ctx) return write();
+
+    // Chain the writes for this document so they land in the order the stages
+    // produced them. Without this, concurrent fire-and-forget updates can
+    // commit out of order and leave the UI showing a stage that already
+    // finished (or drop the final COMPLETED marker).
+    const chained = (ctx.historyWriteChain ?? Promise.resolve())
+      .catch(() => {}) // a failed earlier write must not poison later ones
+      .then(write);
+    ctx.historyWriteChain = chained.catch(() => {});
+    return chained;
   }
 
   /**
-   * Check if this stage is already COMPLETED — used for idempotency on BullMQ retries.
+   * Wait for all pending (fire-and-forget) stage-history writes to settle.
+   * Called once the pipeline finishes so the persisted history is complete
+   * before the version is marked COMPLETED.
+   */
+  static async flushHistory(ctx: PipelineContext): Promise<void> {
+    if (ctx.historyWriteChain) {
+      await ctx.historyWriteChain.catch(() => {});
+    }
+  }
+
+  /**
+   * Check if this stage is already COMPLETED — used for idempotency on retries.
    * Reads from in-memory ctx.stageHistory first; falls back to DB if not populated.
    */
   async isAlreadyCompleted(ctx: PipelineContext): Promise<boolean> {

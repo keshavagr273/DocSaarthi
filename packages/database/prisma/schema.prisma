@@ -85,6 +85,15 @@ enum DocumentCategory {
   MEDICAL_DOCUMENT
   INSURANCE_DOCUMENT
   TAX_DOCUMENT
+  // The classifier prompt and the extraction schema registry in
+  // LlmService already offer these six; without them here, any document
+  // classified as one failed the whole pipeline on a Prisma enum error.
+  RESUME
+  PASSPORT
+  UTILITY_BILL
+  PROPERTY_DOCUMENT
+  TRANSPORT_DOCUMENT
+  FINANCIAL_REPORT
   UNKNOWN
 }
 
@@ -372,6 +381,10 @@ model DocumentChunk {
   @@index([versionId])
   @@index([documentId])
   @@index([pageNumber])
+  // Substring search over chunk text. SearchService's keyword mode relies on
+  // ILIKE '%term%' for Devanagari, which the 'english' text-search config
+  // cannot stem — without this index that is a sequential scan.
+  @@index([content(ops: raw("gin_trgm_ops"))], type: Gin, name: "document_chunks_content_trgm_idx")
   @@map("document_chunks")
 }
 
@@ -385,11 +398,27 @@ model DocumentEmbedding {
   dimension  Int           @default(1536)
   createdAt  DateTime      @default(now())
 
-  // NOTE: The actual vector column is added via raw migration
-  // embedding Unsupported("vector(1536)")
+  // pgvector column. Declared as Unsupported so Prisma knows it exists but
+  // does not try to read or write it — all access is raw SQL (EmbeddingStage
+  // writes it, SearchService queries it with the <=> operator).
+  //
+  // This MUST stay declared. While it was only a comment, Prisma considered
+  // the column drift and `prisma db push` / `migrate dev` generated
+  // `ALTER TABLE document_embeddings DROP COLUMN "embedding"` — silently
+  // destroying every stored vector and all semantic search with it.
+  embedding Unsupported("vector(1536)")?
 
+  // One embedding per chunk. EmbeddingStage relies on this for its
+  // INSERT ... ON CONFLICT ("chunkId") DO UPDATE; without it, a reprocess or
+  // two concurrent jobs on the same document produced duplicate vectors.
+  @@unique([chunkId])
   @@index([documentId])
   @@index([versionId])
+  // NOTE: the HNSW index on `embedding` (vector_cosine_ops) and the GIN
+  // full-text index on document_chunks.content cannot be expressed in Prisma.
+  // They are created by prisma/sql/001_vector_and_search_indexes.sql, so run
+  // `npm run db:setup-search` after every `db push` / `migrate deploy` —
+  // otherwise Prisma drops them and search falls back to sequential scans.
   @@map("document_embeddings")
 }
 
@@ -516,8 +545,15 @@ model Citation {
   id            String        @id @default(cuid())
   messageId     String
   message       Message       @relation(fields: [messageId], references: [id], onDelete: Cascade)
-  chunkId       String
-  chunk         DocumentChunk @relation(fields: [chunkId], references: [id])
+  // Nullable with SetNull: a citation is a permanent record of what a chat
+  // message cited, but the chunk it points at is rebuilt whenever the document
+  // is reprocessed. With a plain required FK, ChunkingStage's deleteMany hit
+  // `citations_chunkId_fkey` and **no document that had ever been cited in a
+  // chat could be reprocessed or retried** — it failed at stage 12 every time.
+  // Everything the UI renders (documentId, versionId, pageNumber, sectionTitle,
+  // bbox) is denormalised onto this row, so losing the chunk link is harmless.
+  chunkId       String?
+  chunk         DocumentChunk? @relation(fields: [chunkId], references: [id], onDelete: SetNull)
   documentId    String
   versionId     String
   pageNumber    Int

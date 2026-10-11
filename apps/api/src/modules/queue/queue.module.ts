@@ -3,6 +3,10 @@ import { BullModule } from '@nestjs/bull';
 import { QUEUES } from '@docsaarthi/shared';
 import { QueueService } from './queue.service';
 
+/**
+ * The single source of truth for this queue's job options. ProcessorModule
+ * registers the same queue by name only, so these apply everywhere.
+ */
 @Global()
 @Module({
   imports: [

@@ -28,6 +28,22 @@ export class ImagePreprocessingStage extends BaseStage {
     super(db);
   }
 
+  /**
+   * The preprocessed buffers live only in memory, so a skipped run leaves
+   * Stage 5 (OCR) with nothing to read — which silently produced empty OCR
+   * results for image documents on every retry. Recompute them instead; the
+   * page PNGs they are derived from are already in storage.
+   */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.preprocessedBuffers && Object.keys(ctx.preprocessedBuffers).length > 0) return;
+
+    ctx.preprocessedBuffers = await this.preprocessPages(ctx);
+
+    this.logger.debug(
+      `[${ctx.documentId}] Rehydrated ${Object.keys(ctx.preprocessedBuffers).length} preprocessed page buffers`,
+    );
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,
@@ -36,6 +52,33 @@ export class ImagePreprocessingStage extends BaseStage {
     this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 22);
 
+    const preprocessedBuffers = await this.preprocessPages(ctx, job);
+    ctx.preprocessedBuffers = preprocessedBuffers;
+
+    this.markStageCompleted(ctx.versionId, ctx);
+    const count = Object.keys(preprocessedBuffers).length;
+    const totalBytes = Object.values(preprocessedBuffers).reduce((s, b) => s + b.length, 0);
+    this.logger.log(
+      `[${ctx.documentId}] Stage 4 DONE — preprocessed ${count} pages | ` +
+      `total buffer=${(totalBytes / 1024).toFixed(1)}KB`,
+    );
+    this.logger.debug(
+      `[${ctx.documentId}] Stage 4 DETAILS:\n` +
+      Object.entries(preprocessedBuffers)
+        .map(([pg, buf]) => `  page ${pg}: ${(buf.length / 1024).toFixed(1)}KB`)
+        .join('\n'),
+    );
+  }
+
+  /**
+   * Download every page image and run the enhancement pipeline over it.
+   * Shared by execute() and rehydrate() so a retry reproduces exactly the
+   * same buffers the first run would have handed to OCR.
+   */
+  private async preprocessPages(
+    ctx: PipelineContext,
+    job?: Job<DocumentProcessingJobData>,
+  ): Promise<Record<number, Buffer>> {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const sharp = require('sharp') as typeof import('sharp');
 
@@ -43,7 +86,8 @@ export class ImagePreprocessingStage extends BaseStage {
     const pageNumbers = Object.keys(pageStorageKeys).map(Number).sort((a, b) => a - b);
     const preprocessedBuffers: Record<number, Buffer> = {};
 
-    for (const pageNum of pageNumbers) {
+    for (let i = 0; i < pageNumbers.length; i++) {
+      const pageNum = pageNumbers[i]!;
       const storageKey = pageStorageKeys[pageNum]!;
 
       try {
@@ -75,23 +119,16 @@ export class ImagePreprocessingStage extends BaseStage {
         }
       }
 
-      await this.reportProgress(job, 22 + Math.round((pageNum / pageNumbers.length) * 6));
+      if (job) {
+        // Progress is driven by position in the list, not by page number —
+        // page numbers can be sparse after a partial render.
+        await this.reportProgress(
+          job,
+          22 + Math.round(((i + 1) / pageNumbers.length) * 6),
+        );
+      }
     }
 
-    ctx.preprocessedBuffers = preprocessedBuffers;
-
-    this.markStageCompleted(ctx.versionId, ctx);
-    const count = Object.keys(preprocessedBuffers).length;
-    const totalBytes = Object.values(preprocessedBuffers).reduce((s, b) => s + b.length, 0);
-    this.logger.log(
-      `[${ctx.documentId}] Stage 4 DONE — preprocessed ${count} pages | ` +
-      `total buffer=${(totalBytes / 1024).toFixed(1)}KB`,
-    );
-    this.logger.debug(
-      `[${ctx.documentId}] Stage 4 DETAILS:\n` +
-      Object.entries(preprocessedBuffers)
-        .map(([pg, buf]) => `  page ${pg}: ${(buf.length / 1024).toFixed(1)}KB`)
-        .join('\n'),
-    );
+    return preprocessedBuffers;
   }
 }

@@ -22,10 +22,25 @@ function getSharedRedis(): Redis | null {
   if (sharedRedisClient) return sharedRedisClient;
   try {
     const redisUrl = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
-    sharedRedisClient = new Redis(redisUrl);
-    sharedRedisClient.on('error', () => {
-      sharedRedisClient = null;
+    const isTls = redisUrl.startsWith('rediss://');
+    const client = new Redis(redisUrl, {
+      // The embedding cache is strictly optional — never let it block the
+      // pipeline or retry forever.
+      maxRetriesPerRequest: 1,
+      enableOfflineQueue: false,
+      connectTimeout: 5000,
+      ...(isTls ? { tls: { rejectUnauthorized: false } } : {}),
     });
+    client.on('error', () => {
+      // Drop AND close the broken client so the next job builds a fresh one.
+      // Previously the handle was leaked here, leaving an orphan socket
+      // reconnecting forever for every failure.
+      if (sharedRedisClient === client) {
+        sharedRedisClient = null;
+        void client.quit().catch(() => client.disconnect());
+      }
+    });
+    sharedRedisClient = client;
     return sharedRedisClient;
   } catch {
     return null;
@@ -33,11 +48,20 @@ function getSharedRedis(): Redis | null {
 }
 
 /**
+ * The pgvector column cannot be expressed in the Prisma schema, so it is
+ * created by prisma/sql/001_vector_and_search_indexes.sql. A deployment that
+ * skips that script would otherwise fail here with "column embedding does not
+ * exist" on every single document, so we verify (and repair) it once per
+ * process before the first insert.
+ */
+let vectorSchemaCheck: Promise<void> | null = null;
+
+/**
  * Stage 13: EMBEDDING
  *
- * Generates OpenAI text-embedding-3-small embeddings for all document chunks.
- * Uses Redis cache keyed by SHA-256 of content to avoid re-computing identical text.
- * Stores embeddings via raw SQL (Prisma doesn't support pgvector natively).
+ * Generates embeddings for all document chunks via LlmService.
+ * Uses a Redis cache keyed by model + SHA-256 of content to avoid re-computing
+ * identical text. Stores vectors via raw SQL (Prisma has no pgvector support).
  */
 @Injectable()
 export class EmbeddingStage extends BaseStage {
@@ -49,6 +73,14 @@ export class EmbeddingStage extends BaseStage {
     private readonly llm: LlmService,
   ) {
     super(db);
+  }
+
+  /**
+   * ctx.embeddings is not read by any later stage (INDEXING counts rows in the
+   * DB), so a skipped EMBEDDING stage needs nothing restored.
+   */
+  async rehydrate(): Promise<void> {
+    // no-op
   }
 
   async execute(
@@ -69,6 +101,16 @@ export class EmbeddingStage extends BaseStage {
       return;
     }
 
+    if (chunkIds.length !== chunks.length) {
+      // chunkIds and chunks are positionally paired; a mismatch would silently
+      // attach every embedding to the wrong chunk.
+      throw new Error(
+        `EMBEDDING_CONTEXT_MISMATCH: ${chunks.length} chunks but ${chunkIds.length} chunk IDs for version ${ctx.versionId}`,
+      );
+    }
+
+    await this.ensureVectorSchema();
+
     // Delete existing embeddings (idempotency)
     await this.db.$executeRaw`
       DELETE FROM document_embeddings WHERE "versionId" = ${ctx.versionId}
@@ -78,71 +120,87 @@ export class EmbeddingStage extends BaseStage {
     const redis = getSharedRedis();
 
     const allEmbeddings: Float32Array[] = [];
+    const modelName = this.llm.getEmbeddingModel();
+    const dimension = this.llm.getEmbeddingDimension();
+    let cacheHits = 0;
+
+    // The model recorded on the rows. Starts as the configured model and is
+    // replaced by whatever actually produced the vectors.
+    let storedModel = modelName;
+    let usedFallback = false;
 
     // Process in batches
     for (let i = 0; i < chunks.length; i += EMBEDDING_BATCH_SIZE) {
       const batchChunks = chunks.slice(i, i + EMBEDDING_BATCH_SIZE);
       const batchIds = chunkIds.slice(i, i + EMBEDDING_BATCH_SIZE);
 
-      const textsToEmbed: string[] = [];
-      const cachedEmbeddings: Map<number, Float32Array> = new Map();
+      // ── Check cache (one round-trip for the whole batch) ────────
+      const cacheKeys = batchChunks.map((c) => this.getCacheKey(c.content, modelName));
+      const cached = await this.getCachedMany(redis, cacheKeys, dimension);
 
-      // Check cache
+      const textsToEmbed: string[] = [];
+      const missingIndexes: number[] = [];
       for (let j = 0; j < batchChunks.length; j++) {
-        const content = batchChunks[j]!.content;
-        const cacheKey = this.getCacheKey(content);
-        const cached = await this.getCached(redis, cacheKey);
-        if (cached) {
-          cachedEmbeddings.set(j, cached);
+        if (cached[j]) {
+          cacheHits++;
         } else {
-          textsToEmbed.push(content);
+          textsToEmbed.push(batchChunks[j]!.content);
+          missingIndexes.push(j);
         }
       }
 
-      // Generate embeddings for non-cached texts
+      // ── Generate embeddings for non-cached texts ────────────────
       let generatedEmbeddings: Float32Array[] = [];
       if (textsToEmbed.length > 0) {
-        generatedEmbeddings = await this.llm.embedBatch(textsToEmbed);
+        const result = await this.llm.embedBatchDetailed(textsToEmbed);
+        generatedEmbeddings = result.vectors;
+
+        // Record the model that actually produced the vectors. On a provider
+        // outage this is the local hash fallback, whose output is comparable
+        // only to itself — storing it under the real model's name made broken
+        // search results impossible to diagnose.
+        if (result.model !== storedModel) {
+          storedModel = result.model;
+        }
+        if (result.isFallback) usedFallback = true;
+
+        if (generatedEmbeddings.length !== textsToEmbed.length) {
+          // Previously a short response produced `undefined` entries that blew
+          // up later inside Array.from() with an opaque error.
+          throw new Error(
+            `EMBEDDING_COUNT_MISMATCH: requested ${textsToEmbed.length} embeddings but provider "${result.model}" returned ${generatedEmbeddings.length}`,
+          );
+        }
       }
 
-      // Merge cached + generated and store
-      let genIdx = 0;
-      for (let j = 0; j < batchChunks.length; j++) {
-        const chunkId = batchIds[j]!;
-        const content = batchChunks[j]!.content;
+      // ── Merge cached + generated, then persist ──────────────────
+      for (let g = 0; g < missingIndexes.length; g++) {
+        const j = missingIndexes[g]!;
+        const embedding = generatedEmbeddings[g]!;
+        cached[j] = embedding;
+        // Cache for future use (best-effort)
+        await this.setCached(redis, cacheKeys[j]!, embedding);
+      }
 
-        let embedding: Float32Array;
-        if (cachedEmbeddings.has(j)) {
-          embedding = cachedEmbeddings.get(j)!;
-        } else {
-          embedding = generatedEmbeddings[genIdx++]!;
-          // Cache for future use
-          const cacheKey = this.getCacheKey(content);
-          await this.setCached(redis, cacheKey, embedding);
+      const rows: Array<{ chunkId: string; vectorStr: string }> = [];
+      for (let j = 0; j < batchChunks.length; j++) {
+        const embedding = cached[j]!;
+
+        if (embedding.length !== dimension) {
+          throw new Error(
+            `EMBEDDING_DIMENSION_MISMATCH: expected ${dimension} dims (pgvector column width) ` +
+            `but got ${embedding.length} from "${storedModel}". Check EMBEDDING_DIMENSION.`,
+          );
         }
 
         allEmbeddings.push(embedding);
-
-        // Store in DB via raw SQL (pgvector requires this)
-        const vectorStr = `[${Array.from(embedding).join(',')}]`;
-        const modelName = this.llm.getEmbeddingModel();
-        const dimension = this.llm.getEmbeddingDimension();
-
-        await this.db.$executeRaw`
-          INSERT INTO document_embeddings (id, "chunkId", "documentId", "versionId", model, dimension, embedding, "createdAt")
-          VALUES (
-            gen_random_uuid()::text,
-            ${chunkId},
-            ${ctx.documentId},
-            ${ctx.versionId},
-            ${modelName},
-            ${dimension},
-            ${vectorStr}::vector,
-            NOW()
-          )
-          ON CONFLICT DO NOTHING
-        `;
+        rows.push({
+          chunkId: batchIds[j]!,
+          vectorStr: `[${Array.from(embedding).join(',')}]`,
+        });
       }
+
+      await this.insertEmbeddingRows(ctx, rows, storedModel, dimension);
 
       await this.reportProgress(
         job,
@@ -154,39 +212,164 @@ export class EmbeddingStage extends BaseStage {
 
     this.markStageCompleted(ctx.versionId, ctx);
     const batchCount = Math.ceil(chunks.length / EMBEDDING_BATCH_SIZE);
-    const activeModel = this.llm.getEmbeddingModel();
-    const activeDim = this.llm.getEmbeddingDimension();
     this.logger.log(
       `[${ctx.documentId}] Stage 13 DONE — embedded ${allEmbeddings.length} chunks | ` +
-      `batches=${batchCount} | model=${activeModel} | dim=${activeDim} | redisConnected=${!!redis}`,
+      `batches=${batchCount} | cacheHits=${cacheHits} | model=${storedModel} | dim=${dimension} | redisConnected=${!!redis}`,
     );
+
+    if (usedFallback) {
+      this.logger.error(
+        `[${ctx.documentId}] Stage 13 used NON-SEMANTIC fallback embeddings (model=${storedModel}). ` +
+        'Semantic search will not find this document until it is re-embedded with a working provider.',
+      );
+    }
     this.logger.debug(
       `[${ctx.documentId}] Stage 13 DETAILS:\n` +
       `  totalChunks     : ${chunks.length}\n` +
       `  embeddingsStored: ${allEmbeddings.length}\n` +
+      `  cacheHits       : ${cacheHits}\n` +
       `  batchSize       : ${EMBEDDING_BATCH_SIZE}\n` +
       `  batchCount      : ${batchCount}\n` +
-      `  embeddingModel  : ${activeModel} (dim ${activeDim})\n` +
+      `  embeddingModel  : ${modelName} (dim ${dimension})\n` +
       `  redisCacheActive: ${!!redis}`,
     );
   }
 
-  // ── Redis cache helpers ───────────────────────────────────────────
+  // ── Persistence ───────────────────────────────────────────────────
 
-  private getCacheKey(content: string): string {
-    const hash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
-    return `docsaarthi:embed:${hash}`;
+  /**
+   * Insert a batch of vectors in a single statement. Prisma's tagged-template
+   * $executeRaw cannot build a variable-length VALUES list, so the placeholder
+   * list is assembled by hand — every value is still bound as a parameter, so
+   * no text is interpolated into the SQL.
+   */
+  private async insertEmbeddingRows(
+    ctx: PipelineContext,
+    rows: Array<{ chunkId: string; vectorStr: string }>,
+    modelName: string,
+    dimension: number,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+
+    const params: unknown[] = [];
+    const valueClauses: string[] = [];
+
+    for (const row of rows) {
+      const base = params.length;
+      valueClauses.push(
+        `(gen_random_uuid()::text, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}::vector, NOW())`,
+      );
+      params.push(row.chunkId, ctx.documentId, ctx.versionId, modelName, dimension, row.vectorStr);
+    }
+
+    const sql =
+      'INSERT INTO document_embeddings ' +
+      '(id, "chunkId", "documentId", "versionId", model, dimension, embedding, "createdAt") VALUES ' +
+      valueClauses.join(', ') +
+      ' ON CONFLICT ("chunkId") DO UPDATE SET ' +
+      'embedding = EXCLUDED.embedding, model = EXCLUDED.model, dimension = EXCLUDED.dimension';
+
+    await this.db.$executeRawUnsafe(sql, ...params);
   }
 
-  private async getCached(redis: Redis | null, key: string): Promise<Float32Array | null> {
+  /**
+   * Verify the pgvector column exists, creating it plus its indexes if not.
+   * Runs at most once per process. Idempotent.
+   */
+  private async ensureVectorSchema(): Promise<void> {
+    if (!vectorSchemaCheck) {
+      vectorSchemaCheck = this.runVectorSchemaCheck().catch((err) => {
+        // Allow a later job to retry rather than caching the failure forever.
+        vectorSchemaCheck = null;
+        throw err;
+      });
+    }
+    return vectorSchemaCheck;
+  }
+
+  private async runVectorSchemaCheck(): Promise<void> {
+    const dimension = this.llm.getEmbeddingDimension();
+
+    const existing = await this.db.$queryRaw<Array<{ udt_name: string }>>`
+      SELECT udt_name
+      FROM information_schema.columns
+      WHERE table_name = 'document_embeddings' AND column_name = 'embedding'
+    `;
+
+    if (existing.length > 0) {
+      this.logger.debug(`pgvector column present (udt=${existing[0]?.udt_name})`);
+      return;
+    }
+
+    this.logger.warn(
+      'document_embeddings.embedding is missing — applying the pgvector schema now. ' +
+      'Add "npm run db:setup-search" to your deploy step to avoid this.',
+    );
+
     try {
-      if (!redis) return null;
-      const value = await redis.get(key);
-      if (!value) return null;
-      const arr = JSON.parse(value) as number[];
-      return new Float32Array(arr);
+      await this.db.$executeRawUnsafe('CREATE EXTENSION IF NOT EXISTS vector');
+      await this.db.$executeRawUnsafe('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+      await this.db.$executeRawUnsafe(
+        `ALTER TABLE document_embeddings ADD COLUMN IF NOT EXISTS embedding vector(${dimension})`,
+      );
+      await this.db.$executeRawUnsafe(
+        'CREATE UNIQUE INDEX IF NOT EXISTS "document_embeddings_chunkId_key" ON document_embeddings ("chunkId")',
+      );
+      await this.db.$executeRawUnsafe(
+        'CREATE INDEX IF NOT EXISTS document_embeddings_embedding_hnsw_idx ' +
+        'ON document_embeddings USING hnsw (embedding vector_cosine_ops)',
+      );
+      await this.db.$executeRawUnsafe(
+        `CREATE INDEX IF NOT EXISTS document_chunks_content_fts_idx ` +
+        `ON document_chunks USING gin (to_tsvector('english', content))`,
+      );
+      await this.db.$executeRawUnsafe(
+        'CREATE INDEX IF NOT EXISTS document_chunks_content_trgm_idx ' +
+        'ON document_chunks USING gin (content gin_trgm_ops)',
+      );
+      this.logger.log(`pgvector schema applied — vector(${dimension}) + HNSW + FTS/trigram indexes`);
+    } catch (err) {
+      throw new Error(
+        'VECTOR_SCHEMA_MISSING: document_embeddings.embedding does not exist and could not be ' +
+        `created (${String(err)}). Run "npm run db:setup-search" against your database.`,
+      );
+    }
+  }
+
+  // ── Redis cache helpers ───────────────────────────────────────────
+
+  /**
+   * The key includes the model name — two providers produce incompatible
+   * vectors for the same text, so they must never share a cache entry.
+   */
+  private getCacheKey(content: string, model: string): string {
+    const hash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+    return `docsaarthi:embed:${model}:${hash}`;
+  }
+
+  private async getCachedMany(
+    redis: Redis | null,
+    keys: string[],
+    dimension: number,
+  ): Promise<Array<Float32Array | null>> {
+    const empty: Array<Float32Array | null> = keys.map(() => null);
+    if (!redis || keys.length === 0) return empty;
+
+    try {
+      const values = await redis.mget(...keys);
+      return values.map((value) => {
+        if (!value) return null;
+        try {
+          const arr = JSON.parse(value) as number[];
+          // Reject stale entries written under a different dimension.
+          if (!Array.isArray(arr) || arr.length !== dimension) return null;
+          return new Float32Array(arr);
+        } catch {
+          return null;
+        }
+      });
     } catch {
-      return null;
+      return empty;
     }
   }
 
@@ -196,7 +379,7 @@ export class EmbeddingStage extends BaseStage {
       const value = JSON.stringify(Array.from(embedding));
       await redis.set(key, value, 'EX', EMBEDDING_CACHE_TTL_SECONDS);
     } catch {
-      // Cache miss is acceptable
+      // Cache write failure is acceptable
     }
   }
 }

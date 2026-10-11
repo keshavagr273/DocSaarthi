@@ -25,6 +25,26 @@ export class PdfRenderingStage extends BaseStage {
     super(db);
   }
 
+  /** Stages 4 and 5 need pageIds / pageStorageKeys to locate page images. */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.pageIds && ctx.pageStorageKeys) return;
+
+    const pages = await this.db.documentPage.findMany({
+      where: { versionId: ctx.versionId },
+      select: { id: true, pageNumber: true, storageKey: true },
+      orderBy: { pageNumber: 'asc' },
+    });
+
+    ctx.pageIds = {};
+    ctx.pageStorageKeys = {};
+    for (const page of pages) {
+      ctx.pageIds[page.pageNumber] = page.id;
+      ctx.pageStorageKeys[page.pageNumber] = page.storageKey;
+    }
+
+    this.logger.debug(`[${ctx.documentId}] Rehydrated ${pages.length} page IDs from DB`);
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,
@@ -41,7 +61,9 @@ export class PdfRenderingStage extends BaseStage {
       (!ctx.mimeType && ctx.storageKey?.toLowerCase().endsWith('.pdf'));
 
     if (isPdf) {
-      const pdfBuffer = await this.storage.downloadBuffer(ctx.storageKey);
+      // Reuse the buffer Stage 1 already downloaded instead of fetching the
+      // same object from storage a second time.
+      const pdfBuffer = ctx.pdfBuffer ?? (await this.storage.downloadBuffer(ctx.storageKey));
       // Cache the buffer in ctx so Stage 5 (OCR) can reuse it without a re-download
       ctx.pdfBuffer = pdfBuffer;
       const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
@@ -55,60 +77,67 @@ export class PdfRenderingStage extends BaseStage {
       const doc = await loadingTask.promise;
       const pageCount = doc.numPages;
 
-      for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
-        await this.reportProgress(job, 14 + Math.round((pageNum / pageCount) * 6));
+      try {
+        for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+          await this.reportProgress(job, 14 + Math.round((pageNum / pageCount) * 6));
 
-        let width = 0;
-        let height = 0;
-        let pageBuffer: Buffer;
+          let width = 0;
+          let height = 0;
+          let pageBuffer: Buffer;
 
-        try {
-          const page = await doc.getPage(pageNum);
-          const viewport = page.getViewport({ scale: 2.0 }); // 2x scale for sharp text OCR and UI viewing
-          const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
-          const canvasContext = canvas.getContext('2d');
+          try {
+            const page = await doc.getPage(pageNum);
+            const viewport = page.getViewport({ scale: 2.0 }); // 2x scale for sharp text OCR and UI viewing
+            const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
+            const canvasContext = canvas.getContext('2d');
 
-          await page.render({ canvasContext, viewport }).promise;
-          // Note: @napi-rs/canvas PNG encoding does not expose compressionLevel in types;
-          // the library uses a fast default internally
-          pageBuffer = canvas.toBuffer('image/png');
-          width = Math.round(viewport.width);
-          height = Math.round(viewport.height);
-        } catch (err) {
-          this.logger.warn(`Failed to render page ${pageNum}: ${String(err)}`);
-          pageBuffer = Buffer.alloc(0);
-        }
+            await page.render({ canvasContext, viewport }).promise;
+            // Note: @napi-rs/canvas PNG encoding does not expose compressionLevel in types;
+            // the library uses a fast default internally
+            pageBuffer = canvas.toBuffer('image/png');
+            width = Math.round(viewport.width);
+            height = Math.round(viewport.height);
+          } catch (err) {
+            this.logger.warn(`Failed to render page ${pageNum}: ${String(err)}`);
+            pageBuffer = Buffer.alloc(0);
+          }
 
-        const pageKey = this.buildPageKey(ctx.storageKey, pageNum);
+          const pageKey = this.buildPageKey(ctx.storageKey, pageNum);
 
-        if (pageBuffer.length > 0) {
-          await this.storage.uploadBuffer(pageKey, pageBuffer, 'image/png');
-        }
+          if (pageBuffer.length > 0) {
+            await this.storage.uploadBuffer(pageKey, pageBuffer, 'image/png');
+          }
 
-        // Upsert document_pages record
-        const page = await this.db.documentPage.upsert({
-          where: {
-            versionId_pageNumber: {
+          // Upsert document_pages record
+          const page = await this.db.documentPage.upsert({
+            where: {
+              versionId_pageNumber: {
+                versionId: ctx.versionId,
+                pageNumber: pageNum,
+              },
+            },
+            create: {
               versionId: ctx.versionId,
               pageNumber: pageNum,
+              storageKey: pageKey,
+              width,
+              height,
             },
-          },
-          create: {
-            versionId: ctx.versionId,
-            pageNumber: pageNum,
-            storageKey: pageKey,
-            width,
-            height,
-          },
-          update: { storageKey: pageKey, width, height },
-        });
+            update: { storageKey: pageKey, width, height },
+          });
 
-        pageIds[pageNum] = page.id;
-        pageStorageKeys[pageNum] = pageKey;
+          pageIds[pageNum] = page.id;
+          pageStorageKeys[pageNum] = pageKey;
 
-        this.logger.debug(
-          `[${ctx.documentId}] S3 page ${pageNum}: ${width}x${height}px → ${(pageBuffer.length / 1024).toFixed(1)}KB PNG → ${pageKey}`,
-        );
+          this.logger.debug(
+            `[${ctx.documentId}] S3 page ${pageNum}: ${width}x${height}px → ${(pageBuffer.length / 1024).toFixed(1)}KB PNG → ${pageKey}`,
+          );
+        }
+      } finally {
+        // Release the pdf.js worker and the parsed page cache for every page
+        // we just rendered — on a 100-page document that is a lot of retained
+        // memory to leave behind.
+        await doc.destroy().catch(() => {});
       }
     } else {
       // Single-page image — use original as the page
@@ -164,8 +193,10 @@ export class PdfRenderingStage extends BaseStage {
   }
 
   private buildPageKey(originalStorageKey: string, pageNum: number): string {
-    const dir = path.dirname(originalStorageKey);
-    const versionDir = path.dirname(dir);
+    // Storage keys are always '/'-separated; use posix semantics so a filename
+    // containing a backslash is not split in the wrong place on Windows.
+    const dir = path.posix.dirname(originalStorageKey);
+    const versionDir = path.posix.dirname(dir);
     return `${versionDir}/pages/page_${pageNum}.png`;
   }
 }

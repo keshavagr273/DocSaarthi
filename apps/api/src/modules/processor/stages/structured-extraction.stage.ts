@@ -24,6 +24,36 @@ export class StructuredExtractionStage extends BaseStage {
     super(db);
   }
 
+  /** Stage 10 cross-references ctx.extractedFields when rescoring. */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.extractedFields) return;
+
+    const rows = await this.db.documentField.findMany({
+      where: { documentId: ctx.documentId, isRejected: false },
+      select: {
+        fieldName: true,
+        fieldType: true,
+        rawValue: true,
+        confidence: true,
+        sourcePage: true,
+        extractionMethod: true,
+      },
+    });
+
+    ctx.extractedFields = rows.map((row) => ({
+      fieldName: row.fieldName,
+      fieldType: row.fieldType as ExtractedField['fieldType'],
+      rawValue: row.rawValue,
+      confidence: row.confidence,
+      sourcePage: row.sourcePage ?? undefined,
+      extractionMethod: row.extractionMethod ?? undefined,
+    }));
+
+    this.logger.debug(
+      `[${ctx.documentId}] Rehydrated ${ctx.extractedFields.length} extracted fields from DB`,
+    );
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,
@@ -38,11 +68,48 @@ export class StructuredExtractionStage extends BaseStage {
     const category = ctx.category ?? 'UNKNOWN';
     const language = ctx.primaryLanguage ?? 'en';
 
+    if (!text.trim()) {
+      // Extraction against an empty string returns nothing but still reports
+      // success, which looks identical to "this document has no fields".
+      this.logger.warn(
+        `[${ctx.documentId}] Stage 9: no normalized text available — skipping extraction. ` +
+        `OCR produced ${(ctx.ocrResults ?? []).length} pages.`,
+      );
+    }
+
     const { fields } = await this.llm.extractFields(text, category, language);
 
-    // Delete any existing fields for this document (idempotency on retry)
-    await this.db.documentField.deleteMany({ where: { documentId: ctx.documentId } });
+    // ── Clear previous extractions, keeping human work ──────────
+    // DocumentField rows are per-document, not per-version, and the review UI
+    // writes a user's corrections straight into them (isVerified = true,
+    // confidence = 1.0). A blanket deleteMany here silently destroyed every
+    // correction a user had made whenever the document was retried or a new
+    // version was uploaded. Keep verified and explicitly-rejected rows, and
+    // don't re-extract the fields they cover.
+    const preserved = await this.db.documentField.findMany({
+      where: {
+        documentId: ctx.documentId,
+        OR: [{ isVerified: true }, { isRejected: true }],
+      },
+      select: { fieldName: true, isVerified: true },
+    });
+    const preservedNames = new Set(preserved.map((f) => f.fieldName));
+
+    await this.db.documentField.deleteMany({
+      where: {
+        documentId: ctx.documentId,
+        isVerified: false,
+        isRejected: false,
+      },
+    });
     await this.db.documentVersionField.deleteMany({ where: { versionId: ctx.versionId } });
+
+    if (preservedNames.size > 0) {
+      this.logger.log(
+        `[${ctx.documentId}] Stage 9: preserving ${preservedNames.size} human-reviewed field(s): ` +
+        `${[...preservedNames].join(', ')}`,
+      );
+    }
 
     const createdFields: ExtractedField[] = [];
     // Use explicit Prisma input types — Parameters<createMany>[0] is optional so .data would be unsafe
@@ -56,9 +123,19 @@ export class StructuredExtractionStage extends BaseStage {
       confidence: number; sourcePage: number | null; extractionMethod: string;
     }[] = [];
 
+    const seenNames = new Set<string>();
+
     for (const field of fields) {
       const rawStr = String(field.rawValue ?? '').trim();
       if (!rawStr) continue; // skip empty extractions
+
+      // Never overwrite a field a human already settled.
+      if (preservedNames.has(field.fieldName)) continue;
+
+      // The model occasionally emits the same field twice; a duplicate would
+      // create two rows and make Stage 10's fieldName lookup ambiguous.
+      if (seenNames.has(field.fieldName)) continue;
+      seenNames.add(field.fieldName);
 
       fieldCreateData.push({
         documentId: ctx.documentId,
@@ -77,7 +154,9 @@ export class StructuredExtractionStage extends BaseStage {
         versionId: ctx.versionId,
         fieldName: field.fieldName,
         fieldType: field.fieldType as never,
-        rawValue: field.rawValue,
+        // Use the trimmed value, same as the documentField row — the two
+        // tables were storing different strings for the same extraction.
+        rawValue: rawStr,
         confidence: field.confidence,
         sourcePage: field.sourcePage ?? null,
         extractionMethod: 'llm',

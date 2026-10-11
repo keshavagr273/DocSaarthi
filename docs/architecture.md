@@ -323,6 +323,20 @@ Separate NestJS application that only processes BullMQ jobs. No HTTP server. Reg
 export class WorkerAppModule {}
 ```
 
+> **As built:** the pipeline is **not** a separate application. All 14 stages run
+> inside the API process as a BullMQ consumer (`apps/api/src/modules/processor`),
+> registered by `ProcessorModule` on the single `document-processing` queue.
+>
+> A standalone `apps/worker` app did exist and was removed: it ran a second,
+> independently-maintained copy of the same stages against the same queue and
+> Redis prefix, so each document was handled by whichever process picked it up
+> first — and the two copies had drifted apart, which also produced duplicate
+> chunk and embedding rows when both processed one document concurrently.
+>
+> To scale ingestion separately from HTTP traffic, run additional replicas of
+> the API image: every instance consumes the same queue, and BullMQ hands each
+> job to exactly one of them.
+
 ### 3.3 Frontend Application (Next.js 15)
 
 Uses the App Router with Server Components where possible, Client Components for interactive UI.
@@ -2343,21 +2357,9 @@ services:
       redis:
         condition: service_healthy
 
-  worker:
-    build:
-      context: .
-      dockerfile: apps/worker/Dockerfile
-    environment:
-      - DATABASE_URL=postgresql://docsaarthi:${POSTGRES_PASSWORD}@postgres:5432/docsaarthi
-      - REDIS_URL=redis://redis:6379
-      - MINIO_ENDPOINT=minio
-      - OCR_PADDLE_URL=http://paddle-ocr:8081
-    depends_on:
-      - postgres
-      - redis
-      - paddle-ocr
-    deploy:
-      replicas: 2
+  # NOTE: there is no separate `worker` service as built — the ingestion
+  # pipeline runs inside the `api` container. To scale ingestion, raise the
+  # replica count on `api`; each replica consumes the same BullMQ queue.
 
   web:
     build:

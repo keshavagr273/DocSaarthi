@@ -6,9 +6,15 @@ export class DatabaseService extends PrismaClient implements OnModuleInit, OnMod
   private readonly logger = new Logger(DatabaseService.name);
 
   constructor() {
+    // `{ emit: 'event', level: 'query' }` was configured with no listener ever
+    // attached, so Prisma serialised an event object for every single query —
+    // and the pipeline issues hundreds per document — with nothing consuming
+    // them. Emit query logs to stdout only when explicitly asked for.
+    const logQueries = process.env['PRISMA_LOG_QUERIES'] === 'true';
+
     super({
       log: [
-        { emit: 'event', level: 'query' },
+        ...(logQueries ? ([{ emit: 'stdout', level: 'query' }] as const) : []),
         { emit: 'stdout', level: 'info' },
         { emit: 'stdout', level: 'warn' },
         { emit: 'stdout', level: 'error' },

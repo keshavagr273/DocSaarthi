@@ -25,6 +25,26 @@ export class ClassificationStage extends BaseStage {
     super(db);
   }
 
+  /**
+   * ctx.category drives which extraction schema Stage 9 uses. Without this,
+   * a retry that skipped classification extracted against the UNKNOWN schema.
+   */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.category) return;
+
+    const document = await this.db.document.findUnique({
+      where: { id: ctx.documentId },
+      select: { category: true, categoryConfidence: true },
+    });
+
+    ctx.category = document?.category ?? 'UNKNOWN';
+    ctx.categoryConfidence = document?.categoryConfidence ?? 0;
+
+    this.logger.debug(
+      `[${ctx.documentId}] Rehydrated category=${ctx.category} from DB`,
+    );
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,
@@ -32,6 +52,23 @@ export class ClassificationStage extends BaseStage {
     this.logger.log(`[${ctx.documentId}] Stage 7: DOCUMENT_CLASSIFICATION`);
     this.markStageProcessing(ctx.versionId, ctx);
     await this.reportProgress(job, 50);
+
+    // A category the user set by hand must survive reprocessing — don't let
+    // the classifier overwrite a manual override.
+    const document = await this.db.document.findUnique({
+      where: { id: ctx.documentId },
+      select: { category: true, categoryConfidence: true, categoryOverride: true },
+    });
+
+    if (document?.categoryOverride) {
+      ctx.category = document.category ?? 'UNKNOWN';
+      ctx.categoryConfidence = document.categoryConfidence ?? 1;
+      this.markStageCompleted(ctx.versionId, ctx);
+      this.logger.log(
+        `[${ctx.documentId}] Stage 7 SKIPPED — keeping user override category=${ctx.category}`,
+      );
+      return;
+    }
 
     // Concatenate OCR text from all pages
     const ocrText = (ctx.ocrResults ?? [])
@@ -41,7 +78,9 @@ export class ClassificationStage extends BaseStage {
 
     const result = await this.llm.classifyDocument(ocrText);
 
-    // Apply minimum confidence threshold
+    // Apply minimum confidence threshold. `result.category` is already
+    // validated against the DocumentCategory enum by LlmService, so it is
+    // always safe to write.
     const MIN_CONFIDENCE = 0.5;
     const category = result.confidence >= MIN_CONFIDENCE ? result.category : 'UNKNOWN';
     const confidence = result.confidence;

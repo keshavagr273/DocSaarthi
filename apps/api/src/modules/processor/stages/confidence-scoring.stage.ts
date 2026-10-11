@@ -6,6 +6,12 @@ import type { PipelineContext, OcrBlock } from './pipeline-context';
 import type { DocumentProcessingJobData } from './pipeline-context';
 
 /**
+ * Shortest text length for which a substring match carries real signal.
+ * Below this, almost any block matches almost any value.
+ */
+const MIN_MATCH_LENGTH = 3;
+
+/**
  * Stage 10: CONFIDENCE_SCORING
  *
  * Recalculates field confidence using a weighted formula:
@@ -20,6 +26,14 @@ export class ConfidenceScoringStage extends BaseStage {
 
   constructor(db: DatabaseService) {
     super(db);
+  }
+
+  /**
+   * This stage only rewrites confidence on rows that already exist; it adds no
+   * new ctx field, so nothing needs restoring.
+   */
+  async rehydrate(): Promise<void> {
+    // no-op
   }
 
   async execute(
@@ -111,10 +125,21 @@ export class ConfidenceScoringStage extends BaseStage {
     if (!rawValue || blocks.length === 0) return null;
 
     const normalizedValue = String(rawValue ?? '').trim().toLowerCase();
+    // A 1-2 character value matches almost any block by substring, which
+    // produced an arbitrary confidence rather than a meaningful one.
+    if (normalizedValue.length < MIN_MATCH_LENGTH) return null;
+
     let best: number | null = null;
 
     for (const block of blocks) {
       const blockText = block.text.trim().toLowerCase();
+
+      // Guard both directions against short/empty block text. `''` is a
+      // substring of everything, so a whitespace-only block previously
+      // matched every field and handed back the highest confidence in the
+      // document.
+      if (blockText.length < MIN_MATCH_LENGTH) continue;
+
       if (blockText.includes(normalizedValue) || normalizedValue.includes(blockText)) {
         if (best === null || block.confidence > best) {
           best = block.confidence;

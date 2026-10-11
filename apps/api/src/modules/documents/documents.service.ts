@@ -25,6 +25,28 @@ const ALLOWED_MIME_TYPES = new Set([
   'image/webp',
 ]);
 
+/**
+ * The pipeline's stages in execution order, matching the array built in
+ * DocumentProcessor. COMPLETED is the terminal marker, not a stage.
+ */
+const PIPELINE_STAGE_ORDER: ProcessingStage[] = [
+  ProcessingStage.FILE_VALIDATION,
+  ProcessingStage.FILE_STORAGE,
+  ProcessingStage.PDF_RENDERING,
+  ProcessingStage.IMAGE_PREPROCESSING,
+  ProcessingStage.OCR,
+  ProcessingStage.LANGUAGE_DETECTION,
+  ProcessingStage.DOCUMENT_CLASSIFICATION,
+  ProcessingStage.TEXT_NORMALIZATION,
+  ProcessingStage.STRUCTURED_EXTRACTION,
+  ProcessingStage.CONFIDENCE_SCORING,
+  ProcessingStage.VALIDATION,
+  ProcessingStage.CHUNKING,
+  ProcessingStage.EMBEDDING,
+  ProcessingStage.INDEXING,
+  ProcessingStage.COMPLETED,
+];
+
 export type FieldDiffStatus = 'UNCHANGED' | 'CHANGED' | 'ADDED' | 'REMOVED';
 
 export interface FieldDiffItem {
@@ -439,8 +461,18 @@ export class DocumentsService {
         processingStatus: ProcessingStatus.QUEUED,
         processingError: null,
         processingErrorCode: null,
+        processingErrorStack: null,
+        processingStage: ProcessingStage.FILE_VALIDATION,
+        // Clear the stage history. The pipeline treats a COMPLETED marker as
+        // "skip this stage", so leaving the history in place made the retry
+        // skip every stage that had already run — including the ones whose
+        // output was wrong — and the document came back unchanged. An explicit
+        // user-initiated retry means reprocess from the start.
+        stageHistory: [],
+        retryCount: { increment: 1 },
         startedAt: null,
         completedAt: null,
+        processingDurationMs: null,
       },
     });
 
@@ -640,8 +672,14 @@ export class DocumentsService {
     }
 
     const completedStages = this.getCompletedStages(version.processingStage ?? null);
-    const totalStages = 15;
-    const progress = Math.round((completedStages.length / totalStages) * 100);
+    // Derive the denominator from the stage list rather than hard-coding it.
+    // It was 15 against a 14-stage pipeline, so progress topped out at 93%
+    // and a finished document never showed 100%.
+    const totalStages = PIPELINE_STAGE_ORDER.length - 1; // excludes COMPLETED
+    const progress =
+      version.processingStatus === ProcessingStatus.COMPLETED
+        ? 100
+        : Math.min(100, Math.round((completedStages.length / totalStages) * 100));
 
     return {
       documentId,
@@ -968,6 +1006,21 @@ export class DocumentsService {
 
     if (!document) throw new NotFoundException('Document not found');
 
+    const maxFileSize = this.config.get<number>('MAX_FILE_SIZE_BYTES', 52428800);
+    if (dto.fileSize > maxFileSize) {
+      throw new BadRequestException(
+        `File too large. Maximum size is ${Math.round(maxFileSize / 1024 / 1024)}MB`,
+      );
+    }
+
+    // initiateUpload and uploadDirect both enforce this; createVersion did
+    // not, so a new version could be any content type at all.
+    if (!ALLOWED_MIME_TYPES.has(dto.mimeType)) {
+      throw new BadRequestException(
+        'File type not supported. Allowed types: PDF, PNG, JPEG, WebP',
+      );
+    }
+
     const nextVersionNumber = (document.versions[0]?.versionNumber ?? 0) + 1;
     const presignExpiry = this.config.get<number>('MINIO_PRESIGN_EXPIRY_SECONDS', 3600);
 
@@ -987,6 +1040,20 @@ export class DocumentsService {
     await this.db.documentVersion.update({
       where: { id: version.id },
       data: { storageKey },
+    });
+
+    // DocumentVersion has no mimeType column, and confirmUpload enqueues the
+    // job with `document.mimeType`. Without this the new version would be
+    // processed as the *first* version's type — upload a PDF over an image and
+    // the pipeline took the image branch, handed sharp a PDF, and produced an
+    // empty document. Keep the document's type in step with its newest file.
+    await this.db.document.update({
+      where: { id: documentId },
+      data: {
+        mimeType: dto.mimeType,
+        originalFileName: dto.fileName,
+        fileSizeBytes: dto.fileSize,
+      },
     });
 
     const presignedUpload = await this.storage.createPresignedUpload(
@@ -1201,27 +1268,12 @@ export class DocumentsService {
   // ── Helpers ─────────────────────────────────────────────────
 
   private getCompletedStages(currentStage: ProcessingStage | null): ProcessingStage[] {
-    const stageOrder: ProcessingStage[] = [
-      ProcessingStage.FILE_VALIDATION,
-      ProcessingStage.FILE_STORAGE,
-      ProcessingStage.PDF_RENDERING,
-      ProcessingStage.IMAGE_PREPROCESSING,
-      ProcessingStage.OCR,
-      ProcessingStage.LANGUAGE_DETECTION,
-      ProcessingStage.DOCUMENT_CLASSIFICATION,
-      ProcessingStage.TEXT_NORMALIZATION,
-      ProcessingStage.STRUCTURED_EXTRACTION,
-      ProcessingStage.CONFIDENCE_SCORING,
-      ProcessingStage.VALIDATION,
-      ProcessingStage.CHUNKING,
-      ProcessingStage.EMBEDDING,
-      ProcessingStage.INDEXING,
-      ProcessingStage.COMPLETED,
-    ];
-
     if (!currentStage) return [];
-    const currentIdx = stageOrder.indexOf(currentStage);
-    return stageOrder.slice(0, currentIdx);
+    const currentIdx = PIPELINE_STAGE_ORDER.indexOf(currentStage);
+    // indexOf returns -1 for a stage not in the list; slice(0, -1) would then
+    // report all-but-one stage as complete.
+    if (currentIdx < 0) return [];
+    return PIPELINE_STAGE_ORDER.slice(0, currentIdx);
   }
 
   private async detectMimeFromStorage(storageKey: string): Promise<string | null> {

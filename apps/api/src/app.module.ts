@@ -25,7 +25,17 @@ import { envSchema } from './config/env.schema';
     // ── Config (global) ─────────────────────────────────────
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: ['.env.local', '.env'],
+      // These paths resolve against process.cwd(), which differs by how the
+      // API is started: the repo root for `npm start`, but apps/api for
+      // `npm run dev` (turbo runs each workspace in its own directory) and
+      // for `node dist/...` run from the app folder.
+      //
+      // Listing both means there is ONE .env at the repo root that is found
+      // either way. Previously only the cwd-relative paths were listed, so a
+      // second apps/api/.env had appeared to make `npm run dev` work — and it
+      // silently shadowed the root file with stale values, including a model
+      // id that no longer exists.
+      envFilePath: ['.env.local', '.env', '../../.env.local', '../../.env'],
       validate: (config) => {
         const result = envSchema.safeParse(config);
         if (!result.success) {

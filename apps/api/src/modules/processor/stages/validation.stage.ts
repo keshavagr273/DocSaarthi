@@ -59,6 +59,14 @@ export class ValidationStage extends BaseStage {
     super(db);
   }
 
+  /**
+   * This stage only normalizes and rescores rows that already exist; it adds no
+   * new ctx field, so nothing needs restoring.
+   */
+  async rehydrate(): Promise<void> {
+    // no-op
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,
@@ -184,9 +192,11 @@ export class ValidationStage extends BaseStage {
     if (!raw) return null;
     const s = raw.trim();
 
+    // All four must be bound — they call this.makeUtcDate internally, so an
+    // unbound reference would throw on `this`.
     const formats: Array<(str: string) => Date | null> = [
-      this.parseDDMMYYYY,
-      this.parseYYYYMMDD,
+      this.parseDDMMYYYY.bind(this),
+      this.parseYYYYMMDD.bind(this),
       this.parseNaturalDate.bind(this),
       this.parseHindiDate.bind(this),
     ];
@@ -198,29 +208,65 @@ export class ValidationStage extends BaseStage {
     return null;
   }
 
+  /**
+   * Build a calendar date in UTC.
+   *
+   * `new Date(y, m, d)` builds the date in the server's local zone, and the
+   * value is then serialised with `.toISOString().split('T')[0]`. In IST
+   * (UTC+5:30) that turned 20-08-2026 into 2026-08-19T18:30:00Z and stored
+   * "2026-08-19" — every parsed date was a day early. Also rejects
+   * out-of-range values that Date would silently roll over (31-02-2026
+   * became 3 March).
+   */
+  private makeUtcDate(year: number, month: number, day: number): Date | null {
+    if (!Number.isInteger(year) || year < 1000 || year > 9999) return null;
+    if (!Number.isInteger(month) || month < 1 || month > 12) return null;
+    if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+
+    const date = new Date(Date.UTC(year, month - 1, day));
+    // Reject rolled-over dates such as 31 February.
+    if (
+      date.getUTCFullYear() !== year ||
+      date.getUTCMonth() !== month - 1 ||
+      date.getUTCDate() !== day
+    ) {
+      return null;
+    }
+    return date;
+  }
+
   private parseDDMMYYYY(s: string): Date | null {
     const m = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
     if (!m) return null;
-    return new Date(parseInt(m[3]!), parseInt(m[2]!) - 1, parseInt(m[1]!));
+    return this.makeUtcDate(parseInt(m[3]!), parseInt(m[2]!), parseInt(m[1]!));
   }
 
   private parseYYYYMMDD(s: string): Date | null {
     const m = s.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
     if (!m) return null;
-    return new Date(parseInt(m[1]!), parseInt(m[2]!) - 1, parseInt(m[3]!));
+    return this.makeUtcDate(parseInt(m[1]!), parseInt(m[2]!), parseInt(m[3]!));
   }
 
-  private parseNaturalDate(s: string): Date | null {
+  private parseNaturalDate(raw: string): Date | null {
+    // Drop ordinal suffixes and a trailing "of": documents routinely write
+    // "6th May 2026" or "1st of April 2026", which previously failed to parse
+    // and dropped the field's confidence to 0.40.
+    const s = raw
+      .replace(/(\d{1,2})(st|nd|rd|th)\b/gi, '$1')
+      .replace(/\bof\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     // "20 August 2026" or "20 Aug 2026" or "Aug 20, 2026"
     const m = s.match(/^(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})$/i);
     if (m) {
       const monthNum = ENGLISH_MONTHS[m[2]!.toLowerCase()];
-      if (monthNum) return new Date(parseInt(m[3]!), monthNum - 1, parseInt(m[1]!));
+      if (monthNum) return this.makeUtcDate(parseInt(m[3]!), monthNum, parseInt(m[1]!));
     }
-    const m2 = s.match(/^([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{4})$/i);
+    const m2 = s.match(/^([a-zA-Z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$/i);
     if (m2) {
       const monthNum = ENGLISH_MONTHS[m2[1]!.toLowerCase()];
-      if (monthNum) return new Date(parseInt(m2[3]!), monthNum - 1, parseInt(m2[2]!));
+      if (monthNum) return this.makeUtcDate(parseInt(m2[3]!), monthNum, parseInt(m2[2]!));
     }
     return null;
   }
@@ -231,7 +277,7 @@ export class ValidationStage extends BaseStage {
       if (s.includes(monthName)) {
         const m = s.match(/(\d{1,2})\D+(\d{4})/);
         if (m) {
-          return new Date(parseInt(m[2]!), monthNum - 1, parseInt(m[1]!));
+          return this.makeUtcDate(parseInt(m[2]!), monthNum, parseInt(m[1]!));
         }
       }
     }
@@ -241,9 +287,41 @@ export class ValidationStage extends BaseStage {
   // ── Currency parsing ─────────────────────────────────────────────
 
   private parseCurrency(raw: string): number | null {
-    const cleaned = raw.replace(/INR|Rs\.?|₹|\s|,/gi, '').trim();
+    // Strip currency markers, thousands separators (Indian lakh/crore
+    // grouping included — "1,00,000" and "1,000,000" both work) and
+    // trailing unit words.
+    // Strip currency markers. Not only INR: extracted documents include
+    // foreign-currency amounts such as "$100.00 USD", which previously failed
+    // to parse and were penalised as unreadable.
+    let cleaned = raw
+      .replace(/(?:INR|RS\.?|RUPEES?|₹|USD|EUR|GBP|AED|[$€£])/gi, '')
+      .replace(/[\s ]/g, '')
+      .replace(/,/g, '')
+      .replace(/\/-$/, '')
+      .replace(/\.$/, '')
+      .trim();
+
+    // Handle a leading sign and parenthesised negatives, e.g. "(1,200)".
+    let negative = false;
+    if (/^\(.*\)$/.test(cleaned)) {
+      negative = true;
+      cleaned = cleaned.slice(1, -1);
+    }
+    if (cleaned.startsWith('-')) {
+      negative = true;
+      cleaned = cleaned.slice(1);
+    } else if (cleaned.startsWith('+')) {
+      cleaned = cleaned.slice(1);
+    }
+
+    // Require the remainder to be purely numeric. parseFloat would otherwise
+    // accept "12 bags of cement" as 12, inventing an amount that is not in
+    // the document.
+    if (!/^\d+(?:\.\d+)?$/.test(cleaned)) return null;
+
     const num = parseFloat(cleaned);
-    return isNaN(num) ? null : num;
+    if (!Number.isFinite(num)) return null;
+    return negative ? -num : num;
   }
 
   // ── GSTIN validation ─────────────────────────────────────────────

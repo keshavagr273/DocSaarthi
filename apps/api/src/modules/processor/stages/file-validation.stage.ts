@@ -17,7 +17,13 @@ async function getPdfPageCount(buffer: Buffer): Promise<number> {
       disableFontFace: true,
     });
     const doc = await loadingTask.promise;
-    return doc.numPages || 1;
+    try {
+      return doc.numPages || 1;
+    } finally {
+      // Release the pdf.js worker — otherwise every validated PDF leaves one
+      // behind for the process lifetime.
+      await doc.destroy().catch(() => {});
+    }
   } catch {
     // Fallback: regex scan for /Type /Page
     const text = buffer.toString('latin1');
@@ -54,6 +60,24 @@ export class FileValidationStage extends BaseStage {
     private readonly storage: StorageService,
   ) {
     super(db);
+  }
+
+  /**
+   * ctx.pdfBuffer is intentionally NOT restored here: later stages already
+   * fall back to downloading it on demand, and holding the whole file in
+   * memory for a skipped stage buys nothing.
+   */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.pageCount) return;
+
+    const version = await this.db.documentVersion.findUnique({
+      where: { id: ctx.versionId },
+      select: { pageCount: true, fileSizeBytes: true, checksum: true },
+    });
+
+    ctx.pageCount = version?.pageCount ?? 1;
+    ctx.fileSizeBytes = version?.fileSizeBytes ?? 0;
+    ctx.checksum = version?.checksum ?? '';
   }
 
   async execute(

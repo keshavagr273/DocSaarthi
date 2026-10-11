@@ -8,6 +8,20 @@ import type { PipelineContext } from './pipeline-context';
 import type { DocumentProcessingJobData } from './pipeline-context';
 
 /**
+ * Open a PDF with pdf.js. The caller owns the document and must destroy() it.
+ */
+async function loadPdf(buffer: Buffer) {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  return pdfjs.getDocument({
+    // Copy the bytes: pdf.js takes ownership of the array it is handed, and
+    // this buffer is cached in ctx for reuse by later stages.
+    data: new Uint8Array(buffer),
+    useSystemFonts: true,
+    disableFontFace: false,
+  }).promise;
+}
+
+/**
  * Stage 2: FILE_STORAGE
  *
  * Generates a thumbnail and stores it in MinIO.
@@ -24,6 +38,19 @@ export class FileStorageStage extends BaseStage {
     private readonly storage: StorageService,
   ) {
     super(db);
+  }
+
+  /** The thumbnail key is read by the API when listing documents. */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.thumbnailStorageKey) return;
+
+    const version = await this.db.documentVersion.findUnique({
+      where: { id: ctx.versionId },
+      select: { thumbnailStorageKey: true },
+    });
+    if (version?.thumbnailStorageKey) {
+      ctx.thumbnailStorageKey = version.thumbnailStorageKey;
+    }
   }
 
   async execute(
@@ -80,16 +107,11 @@ export class FileStorageStage extends BaseStage {
     // Reuse the cached buffer from Stage 1 if available; otherwise download
     const pdfBuffer = cachedBuffer ?? await this.storage.downloadBuffer(storageKey);
 
+    let doc: Awaited<ReturnType<typeof loadPdf>> | null = null;
     try {
-      const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
       const { createCanvas } = await import('@napi-rs/canvas');
 
-      const loadingTask = pdfjs.getDocument({
-        data: new Uint8Array(pdfBuffer),
-        useSystemFonts: true,
-        disableFontFace: false,
-      });
-      const doc = await loadingTask.promise;
+      doc = await loadPdf(pdfBuffer);
       const page = await doc.getPage(1);
       const viewport = page.getViewport({ scale: 1.0 });
       const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
@@ -109,13 +131,18 @@ export class FileStorageStage extends BaseStage {
       return sharp({ create: { width: 400, height: 560, channels: 3, background: '#1e293b' } })
         .webp()
         .toBuffer();
+    } finally {
+      // Release the pdf.js worker whether rendering succeeded or not.
+      if (doc) await doc.destroy().catch(() => {});
     }
   }
 
   private buildThumbnailKey(originalStorageKey: string): string {
-    // Replace the filename with thumbnail.webp
-    const dir = path.dirname(originalStorageKey);
-    const versionDir = path.dirname(dir); // go up one level (out of original/)
+    // Use posix semantics explicitly. Storage keys are always '/'-separated,
+    // but path.dirname on Windows also treats '\' as a separator, so a
+    // filename containing a backslash would be split in the wrong place.
+    const dir = path.posix.dirname(originalStorageKey);
+    const versionDir = path.posix.dirname(dir); // go up one level (out of original/)
     return `${versionDir}/thumbnail.webp`;
   }
 }

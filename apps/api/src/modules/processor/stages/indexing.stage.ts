@@ -22,6 +22,11 @@ export class IndexingStage extends BaseStage {
     super(db);
   }
 
+  /** The final stage — nothing downstream consumes its output. */
+  async rehydrate(): Promise<void> {
+    // no-op
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,

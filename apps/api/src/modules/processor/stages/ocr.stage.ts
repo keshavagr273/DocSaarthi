@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import type { Job } from 'bull';
 import { DatabaseService, ProcessingStage } from '@docsaarthi/database';
 import { BaseStage } from './base.stage';
@@ -8,16 +8,57 @@ import { StorageService } from '../../storage/storage.service';
 import type { PipelineContext, OcrPageResult, OcrBlock } from './pipeline-context';
 import type { DocumentProcessingJobData } from './pipeline-context';
 
+/** Minimal shape of the tesseract.js results we read. */
+interface TesseractLine {
+  text?: string;
+  confidence?: number;
+  bbox?: { x0: number; y0: number; x1: number; y1: number };
+}
+
+interface TesseractResult {
+  data?: {
+    text?: string;
+    confidence?: number;
+    blocks?: Array<{ paragraphs?: Array<{ lines?: TesseractLine[] }> }> | null;
+  };
+}
+
+interface TesseractWorker {
+  recognize(
+    image: Buffer,
+    options?: Record<string, unknown>,
+    output?: Record<string, unknown>,
+  ): Promise<TesseractResult>;
+  terminate(): Promise<unknown>;
+}
+
 /**
- * Stage 5: OCR with VLM Fallback & Selective Block Refinement
+ * Open a PDF with pdf.js once. The caller owns the returned document and must
+ * call destroy() on it.
+ */
+async function openPdf(buffer: Buffer) {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  return pdfjs.getDocument({
+    // Copy the bytes: pdf.js takes ownership of the array it is handed.
+    data: new Uint8Array(buffer),
+    useSystemFonts: true,
+    disableFontFace: false,
+  }).promise;
+}
+
+/**
+ * Stage 5: OCR with VLM and Tesseract fallbacks.
  *
- * 1. Calls PaddleOCR sidecar.
- * 2. If confidence < 0.70 or PaddleOCR is unavailable/empty: routes to Vision LLM fallback.
- * 3. If confidence >= 0.70 but individual blocks are < 0.65: crops block regions with sharp
- *    and refines text with targeted Vision LLM re-reading.
+ * Per page, in order, stopping at the first source that yields text:
+ *  1. The PDF's own text layer, when the document is a PDF.
+ *  2. Vision LLM, when OCR_PROVIDER selects it as primary.
+ *  3. The PaddleOCR sidecar.
+ *  4. Vision LLM, when Paddle's confidence is below OCR_FALLBACK_THRESHOLD,
+ *     returned no blocks, or the sidecar was unreachable.
+ *  5. In-process Tesseract.js, when the VLM is unavailable or produced nothing.
  */
 @Injectable()
-export class OcrStage extends BaseStage {
+export class OcrStage extends BaseStage implements OnModuleDestroy {
   protected readonly stageName = ProcessingStage.OCR;
   protected readonly logger = new Logger(OcrStage.name);
 
@@ -28,6 +69,51 @@ export class OcrStage extends BaseStage {
     private readonly storage: StorageService,
   ) {
     super(db);
+  }
+
+  /**
+   * ctx.ocrResults feeds language detection, classification, normalization,
+   * confidence scoring and chunking — nearly the whole second half of the
+   * pipeline. Restore it from the persisted ocr_results rows.
+   */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.ocrResults && ctx.ocrResults.length > 0) return;
+
+    const rows = await this.db.ocrResult.findMany({
+      where: { versionId: ctx.versionId },
+      orderBy: { pageNumber: 'asc' },
+    });
+
+    // Page pixel dimensions are not stored on ocr_results, but downstream
+    // consumers (and the frontend overlay) read them from document_pages, so
+    // pull them from there rather than reporting 0x0.
+    const pages = await this.db.documentPage.findMany({
+      where: { versionId: ctx.versionId },
+      select: { pageNumber: true, width: true, height: true },
+    });
+    const dimensions = new Map(
+      pages.map((p) => [p.pageNumber, { width: p.width ?? 0, height: p.height ?? 0 }]),
+    );
+
+    ctx.ocrResults = rows.map((row) => {
+      const dim = dimensions.get(row.pageNumber);
+      return {
+        pageNumber: row.pageNumber,
+        width: dim?.width ?? 0,
+        height: dim?.height ?? 0,
+        blocks: Array.isArray(row.blocks) ? (row.blocks as unknown as OcrBlock[]) : [],
+        rawText: row.rawText ?? '',
+        pageConfidence: row.pageConfidence ?? 0,
+        pageLanguage: row.pageLanguage ?? 'en',
+        processingTimeMs: row.processingTimeMs ?? 0,
+        fallbackUsed: row.fallbackUsed ?? false,
+        ...(row.fallbackProvider ? { fallbackProvider: row.fallbackProvider } : {}),
+      };
+    });
+
+    this.logger.debug(
+      `[${ctx.documentId}] Rehydrated ${ctx.ocrResults.length} OCR pages from DB`,
+    );
   }
 
   async execute(
@@ -57,256 +143,294 @@ export class OcrStage extends BaseStage {
 
     const ocrResults: OcrPageResult[] = [];
 
-    for (const pageNum of effectivePageNumbers) {
-      const buffer = preprocessedBuffers[pageNum] ?? Buffer.alloc(0);
+    const isPdf =
+      ctx.mimeType === 'application/pdf' ||
+      (!ctx.mimeType && ctx.storageKey?.toLowerCase().endsWith('.pdf'));
 
-      await this.reportProgress(
-        job,
-        30 + Math.round((pageNum / (pageNumbers.length || 1)) * 14),
-      );
-
-      let result: OcrPageResult | null = null;
-
-      const isPdf =
-        ctx.mimeType === 'application/pdf' ||
-        (!ctx.mimeType && ctx.storageKey?.toLowerCase().endsWith('.pdf'));
-
-      // ── Step 1: For PDFs, try direct text layer extraction first ──
-      if (isPdf) {
-        try {
-          const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
-          // Reuse the PDF buffer already downloaded by Stage 3 (PdfRenderingStage)
-          // to avoid a redundant MinIO network round-trip per page.
-          const pdfBuf = ctx.pdfBuffer ?? await this.storage.downloadBuffer(ctx.storageKey);
-          const doc = await pdfjs.getDocument({
-            data: new Uint8Array(pdfBuf),
-            useSystemFonts: true,
-            disableFontFace: false,
-          }).promise;
-          const page = await doc.getPage(pageNum);
-          const textContent = await page.getTextContent();
-          // CRITICAL FIX: Use scale 2.0 to match the rendered PNG dimensions
-          // stored in documentPages.width/height (PdfRenderingStage renders at 2.0).
-          // Without this, bbox coordinates are in 1x space while the frontend divides
-          // by 2x page dimensions → all overlays appear shifted to the left/top.
-          const viewport = page.getViewport({ scale: 2.0 });
-
-          const textParts: string[] = [];
-          const blocks: OcrBlock[] = [];
-          let order = 0;
-
-          for (const rawItem of textContent.items) {
-            const item = rawItem as { str?: string; transform?: number[]; width?: number; height?: number };
-            if (item.str && item.str.trim()) {
-              textParts.push(item.str);
-              const tx = item.transform ? item.transform[4] || 0 : 0;
-              const ty = item.transform ? item.transform[5] || 0 : 0;
-              const fontHeight = item.transform
-                ? Math.max(Math.abs(item.transform[0] || 0), Math.abs(item.transform[3] || 0), 10)
-                : 10;
-              const itemWidth = item.width || 50;
-
-              // Convert PDF space rectangle to viewport space (canvas pixel coordinates)
-              const rect = viewport.convertToViewportRectangle([tx, ty, tx + itemWidth, ty + fontHeight]);
-              const vx1 = Math.min(rect[0], rect[2]);
-              const vy1 = Math.min(rect[1], rect[3]);
-              const vx2 = Math.max(rect[0], rect[2]);
-              const vy2 = Math.max(rect[1], rect[3]);
-
-              blocks.push({
-                id: `pdf-b-${pageNum}-${order++}`,
-                text: item.str,
-                bbox: [Math.round(vx1), Math.round(vy1), Math.round(vx2), Math.round(vy2)],
-                confidence: 0.99,
-                readingOrder: order,
-                blockType: 'text',
-              });
-            }
-          }
-
-          const rawText = textParts.join(' ');
-
-          if (rawText.trim().length > 0) {
-            this.logger.log(
-              `[${ctx.documentId}] Direct PDF extraction succeeded for page ${pageNum}: ${blocks.length} blocks`,
-            );
-            result = {
-              pageNumber: pageNum,
-              width: Math.round(viewport.width),
-              height: Math.round(viewport.height),
-              blocks,
-              rawText,
-              pageConfidence: 0.98,
-              pageLanguage: 'en',
-              processingTimeMs: 50,
-              fallbackUsed: false,
-            };
-          }
-        } catch (pdfErr) {
-          this.logger.warn(`Direct PDF extraction error on page ${pageNum}: ${String(pdfErr)}`);
-        }
+    // ── Open the PDF once, not once per page ───────────────────────
+    // This used to sit inside the page loop, so an N-page PDF was fully
+    // re-parsed N times (and its pdf.js worker never released). For a 100-page
+    // document that is 100 full parses of the same bytes.
+    let pdfDoc: Awaited<ReturnType<typeof openPdf>> | null = null;
+    if (isPdf) {
+      try {
+        // Reuse the PDF buffer already downloaded by an earlier stage to avoid
+        // a redundant MinIO round-trip.
+        const pdfBuf = ctx.pdfBuffer ?? (await this.storage.downloadBuffer(ctx.storageKey));
+        pdfDoc = await openPdf(pdfBuf);
+      } catch (err) {
+        this.logger.warn(
+          `[${ctx.documentId}] Could not open PDF for direct text extraction: ${String(err)}. Falling back to image OCR.`,
+        );
       }
+    }
 
-      // ── Step 2: Fall back to image-based OCR (PaddleOCR / VLM) ────
-      if (!result) {
-        if (buffer.length > 0) {
-          const ocrProvider = (process.env['OCR_PROVIDER'] || 'paddle').toLowerCase();
-          const fallbackThreshold = Number(process.env['OCR_FALLBACK_THRESHOLD'] ?? 0.75);
+    try {
+      for (let pageIdx = 0; pageIdx < effectivePageNumbers.length; pageIdx++) {
+        const pageNum = effectivePageNumbers[pageIdx]!;
+        const buffer = preprocessedBuffers[pageNum] ?? Buffer.alloc(0);
 
-          let width = 1000;
-          let height = 1400;
+        // Drive progress off position in the list, not the page number — page
+        // numbers can be sparse, which pushed the reported value out of range.
+        await this.reportProgress(
+          job,
+          30 + Math.round(((pageIdx + 1) / effectivePageNumbers.length) * 14),
+        );
+
+        let result: OcrPageResult | null = null;
+
+        // ── Step 1: For PDFs, try direct text layer extraction first ──
+        if (pdfDoc) {
           try {
-            const meta = await sharp(buffer).metadata();
-            width = meta.width ?? width;
-            height = meta.height ?? height;
-          } catch {
-            // keep defaults
-          }
+            const doc = pdfDoc;
+            const page = await doc.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            // CRITICAL FIX: Use scale 2.0 to match the rendered PNG dimensions
+            // stored in documentPages.width/height (PdfRenderingStage renders at 2.0).
+            // Without this, bbox coordinates are in 1x space while the frontend divides
+            // by 2x page dimensions → all overlays appear shifted to the left/top.
+            const viewport = page.getViewport({ scale: 2.0 });
 
-          // Direct Vision / VLM routing if configured as primary provider
-          if (ocrProvider === 'vision' || ocrProvider === 'vlm' || ocrProvider === 'gemini') {
-            this.logger.log(
-              `[${ctx.documentId}] Using primary Vision OCR (${ocrProvider}) for page ${pageNum}...`,
-            );
-            try {
-              const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
-              if (vlmResult.blocks.length > 0 && vlmResult.rawText.trim().length > 0) {
-                result = vlmResult;
+            const textParts: string[] = [];
+            const blocks: OcrBlock[] = [];
+            let order = 0;
+
+            for (const rawItem of textContent.items) {
+              const item = rawItem as { str?: string; transform?: number[]; width?: number; height?: number };
+              if (item.str && item.str.trim()) {
+                textParts.push(item.str);
+                const tx = item.transform ? item.transform[4] || 0 : 0;
+                const ty = item.transform ? item.transform[5] || 0 : 0;
+                const fontHeight = item.transform
+                  ? Math.max(Math.abs(item.transform[0] || 0), Math.abs(item.transform[3] || 0), 10)
+                  : 10;
+                const itemWidth = item.width || 50;
+
+                // Convert PDF space rectangle to viewport space (canvas pixel coordinates)
+                const rect = viewport.convertToViewportRectangle([tx, ty, tx + itemWidth, ty + fontHeight]);
+                const vx1 = Math.min(rect[0], rect[2]);
+                const vy1 = Math.min(rect[1], rect[3]);
+                const vx2 = Math.max(rect[0], rect[2]);
+                const vy2 = Math.max(rect[1], rect[3]);
+
+                blocks.push({
+                  id: `pdf-b-${pageNum}-${order++}`,
+                  text: item.str,
+                  bbox: [Math.round(vx1), Math.round(vy1), Math.round(vx2), Math.round(vy2)],
+                  confidence: 0.99,
+                  readingOrder: order,
+                  blockType: 'text',
+                });
               }
-            } catch (vlmErr) {
-              this.logger.error(`[${ctx.documentId}] Vision OCR failed for page ${pageNum}: ${String(vlmErr)}`);
             }
-          }
 
-          // If not configured for direct vision or vision failed, try PaddleOCR sidecar
-          if (!result) {
-            const paddleResult = await this.ocrClient.recognizePage(buffer, pageNum);
-            width = paddleResult.width || width;
-            height = paddleResult.height || height;
+            const rawText = textParts.join(' ');
 
-            // Trigger VLM fallback if confidence is low, sidecar failed/offline, or very few blocks detected
-            const shouldFallbackToVlm =
-              paddleResult.pageConfidence < fallbackThreshold ||
-              paddleResult.fallbackUsed ||
-              paddleResult.blocks.length === 0 ||
-              (paddleResult.blocks.length < 5 && buffer.length > 50_000);
-
-            if (shouldFallbackToVlm) {
+            if (rawText.trim().length > 0) {
               this.logger.log(
-                `[${ctx.documentId}] Page ${pageNum} confidence=${paddleResult.pageConfidence.toFixed(2)}, blocks=${paddleResult.blocks.length}. Attempting VLM OCR...`,
+                `[${ctx.documentId}] Direct PDF extraction succeeded for page ${pageNum}: ${blocks.length} blocks`,
               );
+              result = {
+                pageNumber: pageNum,
+                width: Math.round(viewport.width),
+                height: Math.round(viewport.height),
+                blocks,
+                rawText,
+                pageConfidence: 0.98,
+                pageLanguage: 'en',
+                processingTimeMs: 50,
+                fallbackUsed: false,
+                provider: 'pdf-text-layer',
+              };
+            }
+          } catch (pdfErr) {
+            this.logger.warn(`Direct PDF extraction error on page ${pageNum}: ${String(pdfErr)}`);
+          }
+        }
 
+        // ── Step 2: Fall back to image-based OCR (PaddleOCR / VLM) ────
+        if (!result) {
+          if (buffer.length > 0) {
+            const ocrProvider = (process.env['OCR_PROVIDER'] || 'paddle').toLowerCase();
+            const fallbackThreshold = Number(process.env['OCR_FALLBACK_THRESHOLD'] ?? 0.75);
+
+            let width = 1000;
+            let height = 1400;
+            try {
+              const meta = await sharp(buffer).metadata();
+              width = meta.width ?? width;
+              height = meta.height ?? height;
+            } catch {
+              // keep defaults
+            }
+
+            // Direct Vision / VLM routing if configured as primary provider
+            if (ocrProvider === 'vision' || ocrProvider === 'vlm' || ocrProvider === 'gemini') {
+              this.logger.log(
+                `[${ctx.documentId}] Using primary Vision OCR (${ocrProvider}) for page ${pageNum}...`,
+              );
               try {
                 const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
-                this.logger.log(
-                  `[${ctx.documentId}] VLM result for page ${pageNum}: blocks=${vlmResult.blocks?.length ?? 0}, chars=${vlmResult.rawText?.length ?? 0}, confidence=${vlmResult.pageConfidence}`,
-                );
                 if (vlmResult.blocks.length > 0 && vlmResult.rawText.trim().length > 0) {
                   result = vlmResult;
                 }
               } catch (vlmErr) {
-                this.logger.error(`[${ctx.documentId}] VLM fallback failed for page ${pageNum}: ${String(vlmErr)}`);
+                this.logger.error(`[${ctx.documentId}] Vision OCR failed for page ${pageNum}: ${String(vlmErr)}`);
               }
+            }
 
-              // If VLM produced no text (or was skipped because LLM is text-only), fall back to built-in Tesseract OCR
-              if (!result || result.blocks.length === 0 || !result.rawText.trim()) {
+            // If not configured for direct vision or vision failed, try PaddleOCR sidecar
+            if (!result) {
+              const paddleResult = await this.ocrClient.recognizePage(buffer, pageNum);
+              width = paddleResult.width || width;
+              height = paddleResult.height || height;
+
+              // Trigger VLM fallback if confidence is low, sidecar failed/offline, or very few blocks detected
+              const shouldFallbackToVlm =
+                paddleResult.pageConfidence < fallbackThreshold ||
+                paddleResult.fallbackUsed ||
+                paddleResult.blocks.length === 0 ||
+                (paddleResult.blocks.length < 5 && buffer.length > 50_000);
+
+              if (shouldFallbackToVlm) {
                 this.logger.log(
-                  `[${ctx.documentId}] Running built-in Tesseract OCR for page ${pageNum}...`,
+                  `[${ctx.documentId}] Page ${pageNum} confidence=${paddleResult.pageConfidence.toFixed(2)}, blocks=${paddleResult.blocks.length}. Attempting VLM OCR...`,
                 );
-                try {
-                  const tessResult = await this.runTesseractOcr(buffer, pageNum, width, height);
-                  if (tessResult.rawText.trim().length > 0) {
-                    result = tessResult;
-                  }
-                } catch (tessErr) {
-                  this.logger.warn(`[${ctx.documentId}] Tesseract OCR failed on page ${pageNum}: ${String(tessErr)}`);
-                }
-              }
 
-              if (!result) {
+                try {
+                  const vlmResult = await this.llm.extractTextFromVision(buffer, pageNum, width, height);
+                  this.logger.log(
+                    `[${ctx.documentId}] VLM result for page ${pageNum}: blocks=${vlmResult.blocks?.length ?? 0}, chars=${vlmResult.rawText?.length ?? 0}, confidence=${vlmResult.pageConfidence}`,
+                  );
+                  if (vlmResult.blocks.length > 0 && vlmResult.rawText.trim().length > 0) {
+                    result = vlmResult;
+                  }
+                } catch (vlmErr) {
+                  this.logger.error(`[${ctx.documentId}] VLM fallback failed for page ${pageNum}: ${String(vlmErr)}`);
+                }
+
+                // If VLM produced no text (or was skipped because LLM is text-only), fall back to built-in Tesseract OCR
+                if (!result || result.blocks.length === 0 || !result.rawText.trim()) {
+                  this.logger.log(
+                    `[${ctx.documentId}] Running built-in Tesseract OCR for page ${pageNum}...`,
+                  );
+                  try {
+                    const tessResult = await this.runTesseractOcr(buffer, pageNum, width, height);
+                    if (tessResult.rawText.trim().length > 0) {
+                      result = tessResult;
+                    }
+                  } catch (tessErr) {
+                    this.logger.warn(`[${ctx.documentId}] Tesseract OCR failed on page ${pageNum}: ${String(tessErr)}`);
+                  }
+                }
+
+                if (!result) {
+                  result = paddleResult;
+                }
+              } else {
                 result = paddleResult;
               }
-            } else {
-              result = paddleResult;
             }
+          } else {
+            this.logger.warn(`[${ctx.documentId}] Empty buffer for page ${pageNum}, returning empty OCR result`);
+            result = {
+              pageNumber: pageNum,
+              width: 0,
+              height: 0,
+              blocks: [],
+              rawText: '',
+              pageConfidence: 0,
+              pageLanguage: 'unknown',
+              processingTimeMs: 0,
+              fallbackUsed: true,
+              provider: 'none',
+            };
           }
-        } else {
-          this.logger.warn(`[${ctx.documentId}] Empty buffer for page ${pageNum}, returning empty OCR result`);
-          result = {
-            pageNumber: pageNum,
-            width: 0,
-            height: 0,
-            blocks: [],
-            rawText: '',
-            pageConfidence: 0,
-            pageLanguage: 'unknown',
-            processingTimeMs: 0,
-            fallbackUsed: true,
-          };
         }
-      }
 
-      // Sanitize null bytes (\u0000) which are invalid in PostgreSQL UTF-8 text columns
-      const sanitizedRawText = (result.rawText ?? '').replace(/\0/g, '');
-      const sanitizedBlocks = (result.blocks ?? []).map((b) => ({
-        ...b,
-        text: (b.text ?? '').replace(/\0/g, ''),
-      }));
-      result.rawText = sanitizedRawText;
-      result.blocks = sanitizedBlocks;
+        // Sanitize null bytes (\u0000) which are invalid in PostgreSQL UTF-8 text columns
+        const sanitizedRawText = (result.rawText ?? '').replace(/\0/g, '');
+        const sanitizedBlocks = (result.blocks ?? []).map((b) => ({
+          ...b,
+          text: (b.text ?? '').replace(/\0/g, ''),
+        }));
+        result.rawText = sanitizedRawText;
+        result.blocks = sanitizedBlocks;
 
-      ocrResults.push(result);
+        ocrResults.push(result);
 
-      // ── Per-page debug summary ────────────────────────────────────
-      const method = !result.fallbackUsed
-        ? (Object.keys(preprocessedBuffers).length === 0 || result.pageConfidence >= 0.98
-            ? 'pdf-direct'
-            : 'paddle')
-        : (result.fallbackProvider || 'vlm-fallback');
-      const textSample = result.rawText.replace(/\n/g, ' ').substring(0, 80);
-      this.logger.log(
-        `[${ctx.documentId}] OCR page ${result.pageNumber}: ` +
-        `method=${method} | blocks=${result.blocks.length} | ` +
-        `confidence=${(result.pageConfidence * 100).toFixed(1)}% | ` +
-        `chars=${result.rawText.length} | lang=${result.pageLanguage}`,
-      );
-      this.logger.debug(
-        `[${ctx.documentId}] OCR page ${result.pageNumber} TEXT SAMPLE:\n  "${textSample}${result.rawText.length > 80 ? '...' : ''}"`,
-      );
+        // ── Per-page debug summary ────────────────────────────────────
+        const method = result.provider ?? (result.fallbackUsed ? 'vision' : 'paddle');
+        const textSample = result.rawText.replace(/\n/g, ' ').substring(0, 80);
+        this.logger.log(
+          `[${ctx.documentId}] OCR page ${result.pageNumber}: ` +
+          `method=${method} | blocks=${result.blocks.length} | ` +
+          `confidence=${(result.pageConfidence * 100).toFixed(1)}% | ` +
+          `chars=${result.rawText.length} | lang=${result.pageLanguage}`,
+        );
+        this.logger.debug(
+          `[${ctx.documentId}] OCR page ${result.pageNumber} TEXT SAMPLE:\n  "${textSample}${result.rawText.length > 80 ? '...' : ''}"`,
+        );
 
-      // Delete existing OCR result for this page (idempotency on retry) then create fresh
-      await this.db.ocrResult.deleteMany({
-        where: { versionId: ctx.versionId, pageNumber: pageNum },
-      });
-      await this.db.ocrResult.create({
-        data: {
-          versionId: ctx.versionId,
-          pageId: pageIds[pageNum] ?? null,
-          pageNumber: pageNum,
-          rawText: sanitizedRawText,
-          blocks: sanitizedBlocks as unknown as object[],
-          pageConfidence: result.pageConfidence,
-          pageLanguage: result.pageLanguage,
-          ocrProvider: result.fallbackProvider ?? (result.fallbackUsed ? 'vlm' : 'paddle'),
-          fallbackUsed: result.fallbackUsed,
-          fallbackProvider: result.fallbackProvider ?? (result.fallbackUsed ? 'openai-vision' : null),
-          processingTimeMs: result.processingTimeMs,
-        },
-      });
-
-      // Update document_pages with detected language and confidence
-      if (pageIds[pageNum]) {
-        await this.db.documentPage.update({
-          where: { id: pageIds[pageNum] },
+        // Delete existing OCR result for this page (idempotency on retry) then create fresh
+        await this.db.ocrResult.deleteMany({
+          where: { versionId: ctx.versionId, pageNumber: pageNum },
+        });
+        await this.db.ocrResult.create({
           data: {
-            language: result.pageLanguage,
-            confidence: result.pageConfidence,
+            versionId: ctx.versionId,
+            pageId: pageIds[pageNum] ?? null,
+            pageNumber: pageNum,
+            rawText: sanitizedRawText,
+            blocks: sanitizedBlocks as unknown as object[],
+            pageConfidence: result.pageConfidence,
+            pageLanguage: result.pageLanguage,
+            // Record the engine that actually read this page rather than
+            // guessing from the fallbackUsed flag, which labelled PDF
+            // text-layer extraction as 'paddle'.
+            ocrProvider: result.provider ?? (result.fallbackUsed ? 'vision' : 'paddle'),
+            fallbackUsed: result.fallbackUsed,
+            fallbackProvider: result.fallbackProvider ?? null,
+            processingTimeMs: result.processingTimeMs,
           },
         });
+
+        // Update document_pages with detected language and confidence
+        if (pageIds[pageNum]) {
+          await this.db.documentPage.update({
+            where: { id: pageIds[pageNum] },
+            data: {
+              language: result.pageLanguage,
+              confidence: result.pageConfidence,
+            },
+          });
+        }
+      }
+    } finally {
+      // Release the pdf.js worker and its parsed page cache. Without this the
+      // document (and every page object it retains) stayed alive for the whole
+      // process lifetime.
+      if (pdfDoc) {
+        await pdfDoc.destroy().catch(() => {});
       }
     }
 
     ctx.ocrResults = ocrResults;
+
+    // OCR is the last consumer of the raw PDF bytes and the preprocessed page
+    // images. For a 100-page scan at 2x these together run to hundreds of MB,
+    // and holding them through the nine remaining stages (which do LLM calls
+    // and embeddings) was the largest single contributor to worker memory.
+    const releasedBytes =
+      (ctx.pdfBuffer?.length ?? 0) +
+      Object.values(ctx.preprocessedBuffers ?? {}).reduce((s, b) => s + b.length, 0);
+    delete ctx.pdfBuffer;
+    delete ctx.preprocessedBuffers;
+    if (releasedBytes > 0) {
+      this.logger.debug(
+        `[${ctx.documentId}] Released ${(releasedBytes / 1024 / 1024).toFixed(1)}MB of page/PDF buffers`,
+      );
+    }
 
     this.markStageCompleted(ctx.versionId, ctx);
     const avgConf = this.avgConfidence(ocrResults);
@@ -333,22 +457,59 @@ export class OcrStage extends BaseStage {
   }
 
   // ── In-Process Tesseract.js OCR Fallback ───────────────────────────
-  // Used on Render / cloud deployments when PaddleOCR sidecar is down and VLM is unavailable.
-  private tesseractWorker: any = null;
+  // Used on Render / cloud deployments when the PaddleOCR sidecar is down and
+  // the VLM is unavailable.
+  //
+  // Held as a promise, not a resolved worker: `if (!worker) worker = await
+  // create()` has an await inside the guard, so two concurrent pages both saw
+  // null, both created a worker, and one was leaked for the lifetime of the
+  // process. Storing the in-flight promise makes the second caller await the
+  // first one's worker.
+  private tesseractWorker: Promise<TesseractWorker> | null = null;
 
-  private async getTesseractWorker() {
+  /** Serializes recognize() calls — a tesseract.js worker handles one job at a time. */
+  private tesseractQueue: Promise<unknown> = Promise.resolve();
+
+  private getTesseractWorker(): Promise<TesseractWorker> {
     if (!this.tesseractWorker) {
-      const { createWorker } = await import('tesseract.js');
-      try {
-        this.tesseractWorker = await createWorker(['eng', 'hin']);
-      } catch (err) {
-        this.logger.warn(
-          `Failed initializing eng+hin Tesseract worker, falling back to eng: ${String(err)}`,
-        );
-        this.tesseractWorker = await createWorker('eng');
-      }
+      this.tesseractWorker = (async () => {
+        const { createWorker } = await import('tesseract.js');
+        try {
+          return (await createWorker(['eng', 'hin'])) as unknown as TesseractWorker;
+        } catch (err) {
+          this.logger.warn(
+            `Failed initializing eng+hin Tesseract worker, falling back to eng: ${String(err)}`,
+          );
+          return (await createWorker('eng')) as unknown as TesseractWorker;
+        }
+      })().catch((err) => {
+        // Don't cache a failed initialization — let the next page retry.
+        this.tesseractWorker = null;
+        throw err;
+      });
     }
     return this.tesseractWorker;
+  }
+
+  private async terminateTesseractWorker(): Promise<void> {
+    const pending = this.tesseractWorker;
+    this.tesseractWorker = null;
+    if (!pending) return;
+    try {
+      const worker = await pending;
+      await worker.terminate();
+    } catch {
+      // Already gone or never started.
+    }
+  }
+
+  /**
+   * Release the Tesseract worker when the module shuts down. Each worker owns
+   * a child process and its loaded language data (~15MB for eng+hin); leaving
+   * it running kept the process alive on shutdown.
+   */
+  async onModuleDestroy(): Promise<void> {
+    await this.terminateTesseractWorker();
   }
 
   private async runTesseractOcr(
@@ -358,28 +519,44 @@ export class OcrStage extends BaseStage {
     height: number,
   ): Promise<OcrPageResult> {
     const startTime = Date.now();
-    let ret: any;
 
+    // Queue behind any in-flight recognize call on the shared worker.
+    const run = this.tesseractQueue.then(
+      () => this.recognizeWithTesseract(imageBuffer),
+      () => this.recognizeWithTesseract(imageBuffer),
+    );
+    this.tesseractQueue = run.catch(() => {});
+    const ret = await run;
+
+    return this.toOcrPageResult(ret, pageNumber, width, height, startTime);
+  }
+
+  private async recognizeWithTesseract(imageBuffer: Buffer): Promise<TesseractResult> {
     try {
       const worker = await this.getTesseractWorker();
-      ret = await worker.recognize(imageBuffer, {}, { blocks: true });
+      return await worker.recognize(imageBuffer, {}, { blocks: true });
     } catch (err) {
       this.logger.warn(
         `Tesseract recognize attempt 1 failed (${String(err)}), resetting worker and retrying with eng...`,
       );
-      try {
-        if (this.tesseractWorker) {
-          await this.tesseractWorker.terminate().catch(() => {});
-        }
-      } catch {
-        // ignore
-      }
-      this.tesseractWorker = null;
-      const { createWorker } = await import('tesseract.js');
-      this.tesseractWorker = await createWorker('eng');
-      ret = await this.tesseractWorker.recognize(imageBuffer, {}, { blocks: true });
-    }
+      await this.terminateTesseractWorker();
 
+      const { createWorker } = await import('tesseract.js');
+      this.tesseractWorker = Promise.resolve(
+        (await createWorker('eng')) as unknown as TesseractWorker,
+      );
+      const worker = await this.tesseractWorker;
+      return worker.recognize(imageBuffer, {}, { blocks: true });
+    }
+  }
+
+  private toOcrPageResult(
+    ret: TesseractResult,
+    pageNumber: number,
+    width: number,
+    height: number,
+    startTime: number,
+  ): OcrPageResult {
     const blocks: OcrBlock[] = [];
     let order = 0;
 
@@ -450,6 +627,7 @@ export class OcrStage extends BaseStage {
       processingTimeMs: Date.now() - startTime,
       fallbackUsed: true,
       fallbackProvider: 'tesseract',
+      provider: 'tesseract',
     };
   }
 }

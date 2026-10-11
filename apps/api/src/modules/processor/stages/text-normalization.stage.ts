@@ -27,6 +27,38 @@ export class TextNormalizationStage extends BaseStage {
     super(db);
   }
 
+  /**
+   * ctx.normalizedText is the only input Stage 9 extracts fields from. Without
+   * this, a retry that skipped normalization sent an empty string to the LLM
+   * and extracted zero fields while still reporting success.
+   *
+   * This stage writes the normalized text back over OcrResult.rawText, so the
+   * rows already rehydrated by OcrStage are the normalized ones.
+   */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.normalizedText) return;
+
+    if (ctx.ocrResults && ctx.ocrResults.length > 0) {
+      ctx.normalizedText = ctx.ocrResults
+        .slice()
+        .sort((a, b) => a.pageNumber - b.pageNumber)
+        .map((r) => r.rawText)
+        .join('\n\n')
+        .trim();
+    } else {
+      const rows = await this.db.ocrResult.findMany({
+        where: { versionId: ctx.versionId },
+        orderBy: { pageNumber: 'asc' },
+        select: { rawText: true },
+      });
+      ctx.normalizedText = rows.map((r) => r.rawText).join('\n\n').trim();
+    }
+
+    this.logger.debug(
+      `[${ctx.documentId}] Rehydrated normalizedText (${ctx.normalizedText.length} chars) from DB`,
+    );
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,

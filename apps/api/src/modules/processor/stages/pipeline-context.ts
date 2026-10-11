@@ -36,7 +36,24 @@ export interface OcrPageResult {
   processingTimeMs: number;
   fallbackUsed: boolean;
   fallbackProvider?: string;
+  /**
+   * What actually produced this text. Persisted to ocr_results.ocrProvider.
+   *
+   * This used to be inferred at the write site as `fallbackUsed ? 'vlm' :
+   * 'paddle'`, which labelled PDF text-layer extraction as 'paddle' and every
+   * vision model as 'vlm' — so the stored provenance did not say which engine
+   * read the page, and OCR quality could not be attributed to an engine.
+   */
+  provider?: OcrProvider;
 }
+
+/** The engines that can produce an OcrPageResult. */
+export type OcrProvider =
+  | 'pdf-text-layer'
+  | 'paddle'
+  | 'vision'
+  | 'tesseract'
+  | 'none';
 
 /**
  * ExtractedField — a single structured field from LLM extraction.
@@ -94,6 +111,12 @@ export interface PipelineContext {
     startedAt?: string;
     completedAt?: string;
   }>;
+
+  /**
+   * Serializes the fire-and-forget stageHistory DB writes for this document so
+   * they commit in stage order. Managed entirely by BaseStage.
+   */
+  historyWriteChain?: Promise<void>;
 
   // ── Stage 1: FILE_VALIDATION ─────────────────────────────────────
   pageCount?: number;

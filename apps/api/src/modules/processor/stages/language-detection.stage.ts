@@ -21,6 +21,23 @@ export class LanguageDetectionStage extends BaseStage {
     super(db);
   }
 
+  /** ctx.primaryLanguage steers the extraction prompt in Stage 9. */
+  async rehydrate(ctx: PipelineContext): Promise<void> {
+    if (ctx.primaryLanguage) return;
+
+    const document = await this.db.document.findUnique({
+      where: { id: ctx.documentId },
+      select: { primaryLanguage: true, secondaryLanguages: true },
+    });
+
+    ctx.primaryLanguage = document?.primaryLanguage ?? 'en';
+    ctx.secondaryLanguages = document?.secondaryLanguages ?? [];
+
+    this.logger.debug(
+      `[${ctx.documentId}] Rehydrated primaryLanguage=${ctx.primaryLanguage} from DB`,
+    );
+  }
+
   async execute(
     ctx: PipelineContext,
     job: Job<DocumentProcessingJobData>,

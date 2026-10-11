@@ -455,7 +455,8 @@ GET    /documents/:id/status   # Processing status
 - [ ] Create `QueueModule` with all queue definitions
 - [ ] Configure queue options (retries, backoff, concurrency)
 - [ ] Create Bull Board dashboard for monitoring at `/admin/queues`
-- [ ] Create `WorkerAppModule` as separate NestJS app
+- [x] ~~Create `WorkerAppModule` as separate NestJS app~~ — built, then removed;
+      the pipeline runs in the API process instead (see `docs/architecture.md`)
 - [ ] Wire Worker app to same Redis instance as API
 - [ ] Implement `DeadLetterHandler` for permanent failures
 - [ ] Add BullMQ event listeners for progress reporting

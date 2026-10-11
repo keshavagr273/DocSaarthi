@@ -21,7 +21,6 @@ export const envSchema = z.object({
   MINIO_BUCKET: z.string().default('docsaarthi'),
   MINIO_USE_SSL: z.string().transform((v) => v === 'true').default('false'),
   MINIO_PRESIGN_EXPIRY_SECONDS: z.coerce.number().default(3600),
-  CLOUDFLARE_API_TOKEN: z.string().optional(),
 
   // JWT
   ACCESS_TOKEN_SECRET: z.string().min(32, 'ACCESS_TOKEN_SECRET must be at least 32 chars'),
@@ -40,7 +39,11 @@ export const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
   DEFAULT_LLM_PROVIDER: z.string().default('groq'),
-  DEFAULT_LLM_MODEL: z.string().default('groq/llama3-8b-8192'),
+  /**
+   * Groq's OpenAI-compatible endpoint takes a bare model id — a 'groq/'
+   * prefix is LiteLLM/OpenRouter routing syntax and 404s here.
+   */
+  DEFAULT_LLM_MODEL: z.string().default('openai/gpt-oss-120b'),
 
   // AI — Vision (Gemini via OpenAI-compat endpoint)
   GEMINI_API_KEY: z.string().optional(),
@@ -53,12 +56,22 @@ export const envSchema = z.object({
   EMBEDDING_API_KEY: z.string().optional(),
   EMBEDDING_BASE_URL: z.string().optional(),
   DEFAULT_EMBEDDING_MODEL: z.string().default('embed-v4.0'),
+  /** Must match the width of the document_embeddings.embedding pgvector column. */
   EMBEDDING_DIMENSION: z.coerce.number().default(1536),
+  /** false → fail the embedding stage instead of storing non-semantic hash vectors. */
+  ALLOW_FALLBACK_EMBEDDINGS: z.string().default('true'),
+
+  // AI — Field extraction budgets
+  EXTRACTION_TEXT_BUDGET_CHARS: z.coerce.number().default(16000),
+  EXTRACTION_MAX_RESPONSE_TOKENS: z.coerce.number().default(4000),
 
   // OCR
   OCR_PROVIDER: z.string().default('paddle'),
   OCR_PADDLE_URL: z.string().default('http://localhost:8081'),
   OCR_FALLBACK_THRESHOLD: z.coerce.number().default(0.7),
+  OCR_PADDLE_TIMEOUT_MS: z.coerce.number().default(120_000),
+  /** How long to skip the PaddleOCR sidecar after it fails. */
+  OCR_CIRCUIT_OPEN_MS: z.coerce.number().default(60_000),
 
   // Limits
   MAX_FILE_SIZE_BYTES: z.coerce.number().default(52428800),
@@ -66,6 +79,7 @@ export const envSchema = z.object({
 
   // Logging
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug', 'verbose']).default('debug'),
+  PRISMA_LOG_QUERIES: z.string().default('false'),
 });
 
 export type Env = z.infer<typeof envSchema>;
